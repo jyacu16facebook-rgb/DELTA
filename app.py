@@ -572,18 +572,9 @@ with tab1:
     x=selected_x_col,
     y=analysis_target,
     color="VARIEDAD",
-    hover_data=[
-        "CAMPAÑA",
-        "AÑO",
-        "SEMANA",
-        "FUNDO",
-        "CAMPO",
-        "VARIEDAD",
-        "ENTITY_KEY",
-    ],
+    hover_data=["CAMPAÑA", "FUNDO", "CAMPO", "ENTITY_KEY"],
     opacity=0.65,
 )
-
         if show_trend:
             fig = add_trendline(fig, scatter_df[selected_x_col], scatter_df[analysis_target])
 
