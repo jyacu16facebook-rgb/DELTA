@@ -313,14 +313,6 @@ def add_trendline(fig, x: pd.Series, y: pd.Series, name: str = "Tendencia lineal
     return fig
 
 
-def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "DATA") -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-    output.seek(0)
-    return output.read()
-
-
 @st.cache_data(show_spinner=True)
 def load_and_prepare_data():
     file_path = find_excel_file(DEFAULT_FILE)
@@ -365,8 +357,6 @@ try:
 except Exception as e:
     st.error(f"Error al cargar o preparar los datos: {e}")
     st.stop()
-
-st.success(f"Archivo cargado correctamente: {loaded_file} | Hoja: {DEFAULT_SHEET}")
 
 with st.expander("Verificación técnica del enfoque usado", expanded=False):
     st.markdown(
@@ -421,27 +411,6 @@ outlier_mode = st.sidebar.radio(
 )
 
 show_trend = st.sidebar.checkbox("Mostrar línea de tendencia lineal", value=True)
-
-st.sidebar.markdown("---")
-st.sidebar.write("Descargas")
-
-# Dataset analítico completo filtrado
-csv_bytes = filtered.to_csv(index=False).encode("utf-8-sig")
-xlsx_bytes = to_excel_bytes(filtered, sheet_name="ANALITICO_FILTRADO")
-
-st.sidebar.download_button(
-    "Descargar dataset analítico filtrado (CSV)",
-    data=csv_bytes,
-    file_name="dataset_analitico_filtrado.csv",
-    mime="text/csv",
-)
-
-st.sidebar.download_button(
-    "Descargar dataset analítico filtrado (Excel)",
-    data=xlsx_bytes,
-    file_name="dataset_analitico_filtrado.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
 
 # Base para visuales
 viz_df = filtered.copy()
