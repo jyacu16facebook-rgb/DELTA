@@ -1,19 +1,20 @@
 import io
 import glob
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from scipy.stats import kruskal
 
 
 # =========================================================
 # CONFIGURACIÓN GENERAL
 # =========================================================
 st.set_page_config(
-    page_title="EDA Delta semanal de peso de baya",
+    page_title="EDA Delta semanal de peso de la baya",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -164,6 +165,12 @@ def add_delta_and_lags(df: pd.DataFrame, lag_max: int = 12) -> pd.DataFrame:
         safe_iso_week_start(y, w) for y, w in zip(df["AÑO"], df["SEMANA"])
     ]
 
+    # Etiquetas auxiliares para visualización
+    df["SEMANA ACTUAL"] = df["SEMANA"]
+    df["AÑO-SEMANA ACTUAL"] = (
+        df["AÑO"].astype("Int64").astype(str) + "-W" + df["SEMANA"].astype("Int64").astype(str).str.zfill(2)
+    )
+
     # Validación de semanas ISO
     invalid_weeks = df["WEEK_START_DATE"].isna().sum()
     if invalid_weeks > 0:
@@ -288,7 +295,6 @@ def add_trendline(fig, x: pd.Series, y: pd.Series, name: str = "Tendencia lineal
     x_v = x_num[valid].values
     y_v = y_num[valid].values
 
-    # Evita error si x tiene un solo valor único
     if len(np.unique(x_v)) < 2:
         return fig
 
@@ -508,7 +514,18 @@ if selected_x_col not in viz_df.columns:
     st.error(f"No existe la columna seleccionada para análisis: {selected_x_col}")
     st.stop()
 
-viz_df = viz_df[[*ID_COLS_DISPLAY, "ENTITY_KEY", TARGET_COL, "DELTA_BW", "DELTA_BW_%", selected_x_col]].copy()
+viz_df = viz_df[
+    [
+        *ID_COLS_DISPLAY,
+        "SEMANA ACTUAL",
+        "AÑO-SEMANA ACTUAL",
+        "ENTITY_KEY",
+        TARGET_COL,
+        "DELTA_BW",
+        "DELTA_BW_%",
+        selected_x_col,
+    ]
+].copy()
 
 if outlier_mode == "Todos excepto outliers":
     valid_mask = iqr_filter_mask(viz_df[analysis_target])
@@ -562,19 +579,43 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 with tab1:
     st.subheader("Scatterplot")
 
-    scatter_df = viz_df[[selected_x_col, analysis_target, "CAMPAÑA", "VARIEDAD", "CAMPO", "FUNDO", "ENTITY_KEY"]].dropna()
+    scatter_df = viz_df[
+        [
+            selected_x_col,
+            analysis_target,
+            "CAMPAÑA",
+            "AÑO",
+            "SEMANA",
+            "SEMANA ACTUAL",
+            "AÑO-SEMANA ACTUAL",
+            "VARIEDAD",
+            "CAMPO",
+            "FUNDO",
+            "ENTITY_KEY",
+        ]
+    ].dropna()
 
     if scatter_df.empty:
         st.warning("No hay datos suficientes para el scatterplot con la selección actual.")
     else:
         fig = px.scatter(
-    scatter_df,
-    x=selected_x_col,
-    y=analysis_target,
-    color="VARIEDAD",
-    hover_data=["CAMPAÑA", "FUNDO", "CAMPO", "ENTITY_KEY"],
-    opacity=0.65,
-)
+            scatter_df,
+            x=selected_x_col,
+            y=analysis_target,
+            color="VARIEDAD",
+            hover_data=[
+                "CAMPAÑA",
+                "AÑO",
+                "SEMANA ACTUAL",
+                "AÑO-SEMANA ACTUAL",
+                "FUNDO",
+                "CAMPO",
+                "VARIEDAD",
+                "ENTITY_KEY",
+            ],
+            opacity=0.65,
+        )
+
         if show_trend:
             fig = add_trendline(fig, scatter_df[selected_x_col], scatter_df[analysis_target])
 
@@ -599,38 +640,142 @@ with tab1:
 with tab2:
     st.subheader("Boxplot por niveles de la variable rezagada")
 
-    box_df = viz_df[[selected_x_col, analysis_target]].dropna().copy()
+    box_df = viz_df[
+        [
+            selected_x_col,
+            analysis_target,
+            "CAMPAÑA",
+            "AÑO",
+            "SEMANA",
+            "SEMANA ACTUAL",
+            "AÑO-SEMANA ACTUAL",
+            "FUNDO",
+            "CAMPO",
+            "TURNO",
+            "VARIEDAD",
+            "ENTITY_KEY",
+        ]
+    ].dropna().copy()
 
     if len(box_df) < 10:
         st.warning("No hay suficientes datos para construir bins interpretables.")
     else:
         try:
             n_bins = st.slider("Número de bins", min_value=4, max_value=10, value=5, key="bins_slider")
+
             box_df["BIN_X"] = pd.qcut(
                 box_df[selected_x_col],
                 q=n_bins,
                 duplicates="drop",
-            ).astype(str)
-
-            fig = px.box(
-                box_df,
-                x="BIN_X",
-                y=analysis_target,
-                points="outliers",
             )
+
+            # Orden correcto de bins
+            ordered_bins = sorted(box_df["BIN_X"].dropna().unique())
+            ordered_bin_labels = [str(b) for b in ordered_bins]
+            box_df["BIN_X_LABEL"] = pd.Categorical(
+                box_df["BIN_X"].astype(str),
+                categories=ordered_bin_labels,
+                ordered=True,
+            )
+
+            # Gráfico mejorado: boxplot + puntos
+            fig = go.Figure()
+
+            for bin_label in ordered_bin_labels:
+                sub = box_df[box_df["BIN_X_LABEL"] == bin_label].copy()
+
+                fig.add_trace(
+                    go.Box(
+                        y=sub[analysis_target],
+                        x=[bin_label] * len(sub),
+                        name=bin_label,
+                        boxpoints="all",
+                        jitter=0.35,
+                        pointpos=-1.8,
+                        marker=dict(size=5, opacity=0.7),
+                        line=dict(width=1.5),
+                        customdata=np.stack(
+                            [
+                                sub["SEMANA ACTUAL"].astype(str),
+                                sub["AÑO-SEMANA ACTUAL"].astype(str),
+                                sub["CAMPAÑA"].astype(str),
+                                sub["FUNDO"].astype(str),
+                                sub["CAMPO"].astype(str),
+                                sub["TURNO"].astype(str),
+                                sub["VARIEDAD"].astype(str),
+                                sub["ENTITY_KEY"].astype(str),
+                                sub[selected_x_col].astype(float),
+                            ],
+                            axis=-1,
+                        ),
+                        hovertemplate=(
+                            f"Grupo bin: %{{x}}<br>"
+                            f"{analysis_target}: %{{y:.4f}}<br>"
+                            "SEMANA ACTUAL: %{customdata[0]}<br>"
+                            "AÑO-SEMANA ACTUAL: %{customdata[1]}<br>"
+                            "CAMPAÑA: %{customdata[2]}<br>"
+                            "FUNDO: %{customdata[3]}<br>"
+                            "CAMPO: %{customdata[4]}<br>"
+                            "TURNO: %{customdata[5]}<br>"
+                            "VARIEDAD: %{customdata[6]}<br>"
+                            f"{selected_x_col}: %{{customdata[8]:.4f}}<br>"
+                            "ENTITY_KEY: %{customdata[7]}<extra></extra>"
+                        ),
+                    )
+                )
+
             fig.update_layout(
                 xaxis_title=f"Bins de {selected_x_col}",
                 yaxis_title=analysis_target,
-                height=600,
+                height=650,
+                showlegend=False,
             )
             st.plotly_chart(fig, use_container_width=True)
 
+            # Resumen estadístico por bin
             summary_box = (
-                box_df.groupby("BIN_X", dropna=False)[analysis_target]
+                box_df.groupby("BIN_X_LABEL", dropna=False)[analysis_target]
                 .agg(["count", "mean", "median", "std"])
                 .reset_index()
+                .rename(columns={"BIN_X_LABEL": "GRUPO", "count": "N", "mean": "MEDIA", "median": "MEDIANA", "std": "DESV_STD"})
             )
-            st.dataframe(summary_box, use_container_width=True)
+
+            summary_box["CV(%)"] = np.where(
+                summary_box["MEDIA"].abs() > 0,
+                (summary_box["DESV_STD"] / summary_box["MEDIA"].abs()) * 100,
+                np.nan,
+            )
+
+            # Kruskal-Wallis
+            kruskal_groups = []
+            for grp in ordered_bin_labels:
+                vals = box_df.loc[box_df["BIN_X_LABEL"] == grp, analysis_target].dropna().values
+                if len(vals) > 0:
+                    kruskal_groups.append(vals)
+
+            if len(kruskal_groups) >= 2:
+                h_stat, p_value = kruskal(*kruskal_groups)
+            else:
+                h_stat, p_value = np.nan, np.nan
+
+            kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+            kc1.metric("Prueba", "Kruskal-Wallis")
+            kc2.metric("Estadístico (H)", f"{h_stat:.4f}" if pd.notna(h_stat) else "NA")
+            kc3.metric("p-valor", f"{p_value:.6f}" if pd.notna(p_value) else "NA")
+            kc4.metric("N", f"{int(summary_box['N'].sum()):,}")
+            kc5.metric("Grupos", f"{len(summary_box):,}")
+
+            summary_box_display = summary_box.copy()
+            summary_box_display["MEDIA"] = summary_box_display["MEDIA"].round(4)
+            summary_box_display["MEDIANA"] = summary_box_display["MEDIANA"].round(4)
+            summary_box_display["DESV_STD"] = summary_box_display["DESV_STD"].round(4)
+            summary_box_display["CV(%)"] = summary_box_display["CV(%)"].round(2)
+
+            st.dataframe(
+                summary_box_display[["GRUPO", "N", "MEDIA", "MEDIANA", "DESV_STD", "CV(%)"]],
+                use_container_width=True,
+            )
+
         except Exception as e:
             st.warning(f"No fue posible generar el boxplot por bins: {e}")
 
@@ -744,6 +889,18 @@ with tab5:
                 y=ts_df[TARGET_COL],
                 mode="lines+markers",
                 name=TARGET_COL,
+                customdata=np.stack(
+                    [
+                        ts_df["SEMANA ACTUAL"].astype(str),
+                        ts_df["AÑO-SEMANA ACTUAL"].astype(str),
+                    ],
+                    axis=-1,
+                ),
+                hovertemplate=(
+                    f"{TARGET_COL}: %{{y:.4f}}<br>"
+                    "SEMANA ACTUAL: %{customdata[0]}<br>"
+                    "AÑO-SEMANA ACTUAL: %{customdata[1]}<extra></extra>"
+                ),
             )
         )
         fig.add_trace(
@@ -753,6 +910,18 @@ with tab5:
                 mode="lines+markers",
                 name="DELTA_BW",
                 yaxis="y2",
+                customdata=np.stack(
+                    [
+                        ts_df["SEMANA ACTUAL"].astype(str),
+                        ts_df["AÑO-SEMANA ACTUAL"].astype(str),
+                    ],
+                    axis=-1,
+                ),
+                hovertemplate=(
+                    "DELTA_BW: %{y:.4f}<br>"
+                    "SEMANA ACTUAL: %{customdata[0]}<br>"
+                    "AÑO-SEMANA ACTUAL: %{customdata[1]}<extra></extra>"
+                ),
             )
         )
 
@@ -764,6 +933,18 @@ with tab5:
                     mode="lines+markers",
                     name=selected_x_col,
                     yaxis="y3",
+                    customdata=np.stack(
+                        [
+                            ts_df["SEMANA ACTUAL"].astype(str),
+                            ts_df["AÑO-SEMANA ACTUAL"].astype(str),
+                        ],
+                        axis=-1,
+                    ),
+                    hovertemplate=(
+                        f"{selected_x_col}: %{{y:.4f}}<br>"
+                        "SEMANA ACTUAL: %{customdata[0]}<br>"
+                        "AÑO-SEMANA ACTUAL: %{customdata[1]}<extra></extra>"
+                    ),
                 )
             )
 
@@ -794,6 +975,8 @@ with tab5:
                     "AÑO",
                     "CAMPAÑA",
                     "SEMANA",
+                    "SEMANA ACTUAL",
+                    "AÑO-SEMANA ACTUAL",
                     "FUNDO",
                     "ETAPA",
                     "CAMPO",
