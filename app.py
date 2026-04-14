@@ -21,7 +21,7 @@ st.set_page_config(
 
 DEFAULT_FILE = "DELTA CONSOLIDADO 2022-2025.xlsx"
 DEFAULT_SHEET = "DATA"
-MAX_LAG = 12
+MAX_LAG = 15
 
 ID_COLS_DISPLAY = [
     "AÑO",
@@ -50,6 +50,7 @@ PHENOLOGY_COLS = [
     "FLORES",
     "FRUTO CUAJADO",
     "FRUTO VERDE",
+    "TOTAL DE FRUTOS",
     "FRUTO CREMOSO",
     "FRUTO ROSADO",
     "FRUTO MADURO",
@@ -65,7 +66,6 @@ OPTIONAL_EXTRA_COLS = [
     "kilogramos",
     "Ha COSECHADA",
     "Ha TURNO",
-    "TOTAL DE FRUTOS",
 ]
 
 ALL_ANALYSIS_BASE_COLS = ID_COLS_DISPLAY + PHENOLOGY_COLS + CONTROL_COLS + [TARGET_COL]
@@ -139,7 +139,7 @@ def build_entity_key(df: pd.DataFrame) -> pd.Series:
     )
 
 
-def add_delta_and_lags(df: pd.DataFrame, lag_max: int = 12) -> pd.DataFrame:
+def add_delta_and_lags(df: pd.DataFrame, lag_max: int = 15) -> pd.DataFrame:
     """
     Calcula:
     - DELTA_BW
@@ -311,71 +311,6 @@ def add_trendline(fig, x: pd.Series, y: pd.Series, name: str = "Tendencia lineal
         )
     )
     return fig
-
-
-def build_correlation_table(df: pd.DataFrame, target_col: str, base_vars: list[str], lag_max: int) -> pd.DataFrame:
-    rows = []
-
-    for var in base_vars:
-        for lag in range(1, lag_max + 1):
-            lag_col = f"{var}__LAG_{lag}"
-            if lag_col not in df.columns:
-                continue
-
-            tmp = df[[target_col, lag_col]].dropna()
-            n = len(tmp)
-            if n < 3:
-                continue
-
-            pearson = tmp[target_col].corr(tmp[lag_col], method="pearson")
-            spearman = tmp[target_col].corr(tmp[lag_col], method="spearman")
-
-            rows.append(
-                {
-                    "variable_base": var,
-                    "lag": lag,
-                    "variable_lag": lag_col,
-                    "n": n,
-                    "pearson": pearson,
-                    "spearman": spearman,
-                    "abs_spearman": abs(spearman) if pd.notna(spearman) else np.nan,
-                }
-            )
-
-    if not rows:
-        return pd.DataFrame(columns=["variable_base", "lag", "variable_lag", "n", "pearson", "spearman", "abs_spearman"])
-
-    out = pd.DataFrame(rows).sort_values(
-        ["abs_spearman", "n"], ascending=[False, False]
-    ).reset_index(drop=True)
-    return out
-
-
-def build_stability_table(df: pd.DataFrame, x_col: str, y_col: str, group_col: str) -> pd.DataFrame:
-    rows = []
-
-    if group_col not in df.columns:
-        return pd.DataFrame()
-
-    for grp, sub in df.groupby(group_col, dropna=False):
-        tmp = sub[[x_col, y_col]].dropna()
-        n = len(tmp)
-        if n < 3:
-            continue
-
-        rows.append(
-            {
-                group_col: grp,
-                "n": n,
-                "pearson": tmp[x_col].corr(tmp[y_col], method="pearson"),
-                "spearman": tmp[x_col].corr(tmp[y_col], method="spearman"),
-            }
-        )
-
-    if not rows:
-        return pd.DataFrame(columns=[group_col, "n", "pearson", "spearman"])
-
-    return pd.DataFrame(rows).sort_values(["n", "spearman"], ascending=[False, False]).reset_index(drop=True)
 
 
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "DATA") -> bytes:
@@ -563,12 +498,10 @@ with st.expander("Ver porcentaje de faltantes por variable", expanded=False):
 # =========================================================
 # TABS
 # =========================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3 = st.tabs(
     [
         "Scatterplot",
         "Boxplot",
-        "Correlaciones",
-        "Estabilidad",
         "Series temporales",
     ]
 )
@@ -780,91 +713,9 @@ with tab2:
             st.warning(f"No fue posible generar el boxplot por bins: {e}")
 
 # =========================================================
-# TAB 3: CORRELACIONES
+# TAB 3: SERIES TEMPORALES
 # =========================================================
 with tab3:
-    st.subheader("Ranking de correlaciones por variable y lag")
-
-    corr_base_df = filtered.copy()
-    if outlier_mode == "Todos excepto outliers":
-        mask = iqr_filter_mask(corr_base_df[analysis_target])
-        corr_base_df = corr_base_df[mask].copy()
-
-    corr_table = build_correlation_table(
-        corr_base_df,
-        target_col=analysis_target,
-        base_vars=base_analysis_vars,
-        lag_max=MAX_LAG,
-    )
-
-    if corr_table.empty:
-        st.warning("No hay suficientes datos para calcular correlaciones.")
-    else:
-        st.dataframe(corr_table, use_container_width=True)
-
-        top_corr = corr_table.head(20).copy()
-
-        fig = px.bar(
-            top_corr,
-            x="variable_lag",
-            y="spearman",
-            hover_data=["n", "pearson"],
-        )
-        fig.update_layout(
-            xaxis_title="Variable rezagada",
-            yaxis_title="Spearman",
-            height=550,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# =========================================================
-# TAB 4: ESTABILIDAD
-# =========================================================
-with tab4:
-    st.subheader("Estabilidad de la relación observada")
-
-    stability_group = st.selectbox(
-        "Evaluar estabilidad por",
-        options=["CAMPAÑA", "VARIEDAD", "CAMPO", "FUNDO", "ETAPA", "TURNO"],
-        index=0,
-    )
-
-    stab_df = filtered[[stability_group, selected_x_col, analysis_target]].copy().dropna()
-
-    if outlier_mode == "Todos excepto outliers" and not stab_df.empty:
-        mask = iqr_filter_mask(stab_df[analysis_target])
-        stab_df = stab_df[mask].copy()
-
-    stab_table = build_stability_table(
-        stab_df,
-        x_col=selected_x_col,
-        y_col=analysis_target,
-        group_col=stability_group,
-    )
-
-    if stab_table.empty:
-        st.warning("No hay suficientes datos para evaluar estabilidad con la selección actual.")
-    else:
-        st.dataframe(stab_table, use_container_width=True)
-
-        top_n = min(20, len(stab_table))
-        fig = px.bar(
-            stab_table.head(top_n),
-            x=stability_group,
-            y="spearman",
-            hover_data=["n", "pearson"],
-        )
-        fig.update_layout(
-            xaxis_title=stability_group,
-            yaxis_title="Spearman",
-            height=550,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# =========================================================
-# TAB 5: SERIES TEMPORALES
-# =========================================================
-with tab5:
     st.subheader("Series temporales por grupo")
 
     entity_options = sorted(filtered["ENTITY_KEY"].dropna().unique().tolist())
