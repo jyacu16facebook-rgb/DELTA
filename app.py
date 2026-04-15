@@ -1,4 +1,3 @@
-import io
 import glob
 from datetime import datetime
 
@@ -23,6 +22,39 @@ DEFAULT_FILE = "DELTA CONSOLIDADO 2022-2025.xlsx"
 DEFAULT_SHEET = "DATA"
 MAX_LAG = 15
 
+# =========================================================
+# MAPEO: DATA ACTUAL -> NOMBRES INTERNOS DEL CÓDIGO ORIGINAL
+# =========================================================
+CURRENT_TO_INTERNAL = {
+    "año": "AÑO",
+    "campaña": "CAMPAÑA",
+    "semana": "SEMANA",
+    "fundo": "FUNDO",
+    "etapa": "ETAPA",
+    "campo": "CAMPO",
+    "turno": "TURNO",
+    "variedad": "VARIEDAD",
+    "conteo_flores": "FLORES",
+    "conteo_fruto_cuajado": "FRUTO CUAJADO",
+    "conteo_fruto_verde": "FRUTO VERDE",
+    "conteo_total_frutos": "TOTAL DE FRUTOS",
+    "conteo_bayas_cremosas": "FRUTO CREMOSO",
+    "conteo_bayas_rosadas": "FRUTO ROSADO",
+    "conteo_bayas_maduras": "FRUTO MADURO",
+    "peso_promedio_baya_g": "PESO BAYA (g)",
+}
+
+# Mapeo de variables base internas -> prefijo lag actual
+INTERNAL_BASE_TO_CURRENT_LAG_PREFIX = {
+    "FLORES": "conteo_flores",
+    "FRUTO CUAJADO": "conteo_fruto_cuajado",
+    "FRUTO VERDE": "conteo_fruto_verde",
+    "TOTAL DE FRUTOS": "conteo_total_frutos",
+    "FRUTO CREMOSO": "conteo_bayas_cremosas",
+    "FRUTO ROSADO": "conteo_bayas_rosadas",
+    "FRUTO MADURO": "conteo_bayas_maduras",
+}
+
 ID_COLS_DISPLAY = [
     "AÑO",
     "CAMPAÑA",
@@ -34,7 +66,6 @@ ID_COLS_DISPLAY = [
     "VARIEDAD",
 ]
 
-# Grupo real para cálculos temporales
 ENTITY_COLS = [
     "CAMPAÑA",
     "FUNDO",
@@ -56,30 +87,18 @@ PHENOLOGY_COLS = [
     "FRUTO MADURO",
 ]
 
-CONTROL_COLS = [
-    "CALIBRE BAYA (mm)",
-    "KG/HA",
-    "DENSIDAD",
-]
+# En la data actual ya no existen estas como base directa
+CONTROL_COLS = []
 
-OPTIONAL_EXTRA_COLS = [
-    "kilogramos",
-    "Ha COSECHADA",
-    "Ha TURNO",
-]
+OPTIONAL_EXTRA_COLS = []
 
-ALL_ANALYSIS_BASE_COLS = ID_COLS_DISPLAY + PHENOLOGY_COLS + CONTROL_COLS + [TARGET_COL]
-KEEP_IF_EXISTS = ALL_ANALYSIS_BASE_COLS + OPTIONAL_EXTRA_COLS
+ALL_ANALYSIS_BASE_COLS = ID_COLS_DISPLAY + PHENOLOGY_COLS + [TARGET_COL]
 
 
 # =========================================================
 # FUNCIONES AUXILIARES
 # =========================================================
 def find_excel_file(default_file: str) -> str:
-    """
-    Busca primero el archivo exacto en la raíz del repo.
-    Si no existe, intenta encontrar un .xlsx disponible.
-    """
     if default_file in glob.glob("*.xlsx"):
         return default_file
 
@@ -88,15 +107,11 @@ def find_excel_file(default_file: str) -> str:
         return files[0]
 
     raise FileNotFoundError(
-        f"No se encontró el archivo '{default_file}' ni ningún archivo .xlsx en la raíz del repositorio."
+        f"No se encontró el archivo '{default_file}' ni ningún archivo .xlsx en la raíz."
     )
 
 
 def safe_iso_week_start(year, week):
-    """
-    Convierte (AÑO, SEMANA) a la fecha del lunes de esa semana ISO.
-    Si la semana es inválida, devuelve NaT.
-    """
     try:
         year = int(year)
         week = int(week)
@@ -109,8 +124,7 @@ def validate_columns(df: pd.DataFrame, required_cols: list[str]):
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(
-            "Faltan columnas obligatorias en el archivo: "
-            + ", ".join(missing)
+            "Faltan columnas obligatorias en el archivo: " + ", ".join(missing)
         )
 
 
@@ -139,39 +153,59 @@ def build_entity_key(df: pd.DataFrame) -> pd.Series:
     )
 
 
-def add_delta_and_lags(df: pd.DataFrame, lag_max: int = 15) -> pd.DataFrame:
+def standardize_current_data(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula:
-    - DELTA_BW
-    - DELTA_BW_%
-    - lags de 1..lag_max para variables fenológicas y de control
-
-    Reglas:
-    - El cálculo es por ENTITY_COLS
-    - Orden por CAMPAÑA + AÑO + SEMANA
-    - Solo se calcula si la continuidad semanal es real:
-      fecha_actual - fecha_pasada == 7 * lag días
-    - Si falta semana intermedia, queda NaN
-    - Si falta peso previo, delta queda NaN
-    - Si peso previo <= 0, DELTA_BW_% queda NaN
+    Renombra columnas actuales a nombres internos del código original
+    y crea las columnas tipo VAR__LAG_n usando las columnas ya lageadas
+    que trae la data actual.
     """
     df = df.copy()
 
-    # Orden temporal dentro de la campaña
+    # Normalizar nombres originales leídos
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Validar columnas base actuales obligatorias
+    required_current_cols = list(CURRENT_TO_INTERNAL.keys())
+    validate_columns(df, required_current_cols)
+
+    # Renombrar columnas base a nombres internos
+    rename_base = {k: v for k, v in CURRENT_TO_INTERNAL.items() if k in df.columns}
+    df = df.rename(columns=rename_base)
+
+    # Crear columnas internas de lags con el nombre que esperaba el código original
+    for internal_var, current_prefix in INTERNAL_BASE_TO_CURRENT_LAG_PREFIX.items():
+        for lag in range(1, MAX_LAG + 1):
+            current_lag_col = f"{current_prefix}_semana_{lag}_anterior"
+            internal_lag_col = f"{internal_var}__LAG_{lag}"
+
+            if current_lag_col in df.columns:
+                df[internal_lag_col] = pd.to_numeric(df[current_lag_col], errors="coerce")
+            else:
+                df[internal_lag_col] = np.nan
+
+    return df
+
+
+def add_delta_only(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mantiene la lógica temporal original para DELTA_BW y DELTA_BW_%,
+    pero NO recalcula lags porque ahora ya vienen en la data.
+    """
+    df = df.copy()
+
     df = df.sort_values(ENTITY_COLS + ["AÑO", "SEMANA"], kind="stable").reset_index(drop=True)
 
-    # Fecha inicio de semana ISO
     df["WEEK_START_DATE"] = [
         safe_iso_week_start(y, w) for y, w in zip(df["AÑO"], df["SEMANA"])
     ]
 
-    # Etiquetas auxiliares para visualización
     df["SEMANA ACTUAL"] = df["SEMANA"]
     df["AÑO-SEMANA ACTUAL"] = (
-        df["AÑO"].astype("Int64").astype(str) + "-W" + df["SEMANA"].astype("Int64").astype(str).str.zfill(2)
+        df["AÑO"].astype("Int64").astype(str)
+        + "-W"
+        + df["SEMANA"].astype("Int64").astype(str).str.zfill(2)
     )
 
-    # Validación de semanas ISO
     invalid_weeks = df["WEEK_START_DATE"].isna().sum()
     if invalid_weeks > 0:
         st.warning(
@@ -179,7 +213,6 @@ def add_delta_and_lags(df: pd.DataFrame, lag_max: int = 15) -> pd.DataFrame:
             "Esas filas no podrán participar correctamente en cálculos temporales."
         )
 
-    # Verificación de duplicados por grupo-semana
     dup_mask = df.duplicated(subset=ENTITY_COLS + ["AÑO", "SEMANA"], keep=False)
     n_dup = int(dup_mask.sum())
     if n_dup > 0:
@@ -192,7 +225,6 @@ def add_delta_and_lags(df: pd.DataFrame, lag_max: int = 15) -> pd.DataFrame:
 
     g = df.groupby(ENTITY_COLS, dropna=False, sort=False)
 
-    # Delta absoluto y delta %
     prev_weight = g[TARGET_COL].shift(1)
     prev_week_date = g["WEEK_START_DATE"].shift(1)
 
@@ -214,36 +246,11 @@ def add_delta_and_lags(df: pd.DataFrame, lag_max: int = 15) -> pd.DataFrame:
         np.nan,
     )
 
-    # Variables para las que sí construiremos lags
-    lag_vars = [c for c in PHENOLOGY_COLS + CONTROL_COLS if c in df.columns]
-
-    for var in lag_vars:
-        for lag in range(1, lag_max + 1):
-            lag_val = g[var].shift(lag)
-            lag_date = g["WEEK_START_DATE"].shift(lag)
-
-            consecutive_lag = (
-                df["WEEK_START_DATE"].notna()
-                & lag_date.notna()
-                & ((df["WEEK_START_DATE"] - lag_date) == pd.Timedelta(days=7 * lag))
-            )
-
-            new_col = f"{var}__LAG_{lag}"
-            df[new_col] = np.where(
-                consecutive_lag & lag_val.notna(),
-                lag_val,
-                np.nan,
-            )
-
     df["ENTITY_KEY"] = build_entity_key(df)
     return df
 
 
 def iqr_filter_mask(series: pd.Series) -> pd.Series:
-    """
-    Devuelve máscara True para valores NO outliers según IQR.
-    NaN se devuelve como False para visuales que necesiten datos válidos.
-    """
     s = pd.to_numeric(series, errors="coerce")
     valid = s.dropna()
     if valid.empty:
@@ -282,9 +289,6 @@ def apply_sidebar_filters(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_trendline(fig, x: pd.Series, y: pd.Series, name: str = "Tendencia lineal"):
-    """
-    Agrega línea de tendencia lineal simple.
-    """
     x_num = pd.to_numeric(x, errors="coerce")
     y_num = pd.to_numeric(y, errors="coerce")
     valid = x_num.notna() & y_num.notna()
@@ -318,15 +322,28 @@ def load_and_prepare_data():
     file_path = find_excel_file(DEFAULT_FILE)
     df = pd.read_excel(file_path, sheet_name=DEFAULT_SHEET, engine="openpyxl")
 
-    # Limpieza básica de nombres y textos
     df.columns = [str(c).strip() for c in df.columns]
-    df = normalize_text_cols(df, ENTITY_COLS + ["CAMPAÑA", "FUNDO", "ETAPA", "CAMPO", "TURNO", "VARIEDAD"])
 
-    required_cols = list(set(ID_COLS_DISPLAY + PHENOLOGY_COLS + CONTROL_COLS + [TARGET_COL]))
-    validate_columns(df, required_cols)
+    # Adaptar estructura actual a estructura interna
+    df = standardize_current_data(df)
 
-    # Mantener columnas clave + extras si existen
-    keep_cols = [c for c in KEEP_IF_EXISTS if c in df.columns]
+    # Normalización de textos
+    df = normalize_text_cols(
+        df,
+        ["CAMPAÑA", "FUNDO", "ETAPA", "CAMPO", "TURNO", "VARIEDAD"]
+    )
+
+    # Mantener solo columnas realmente necesarias
+    lag_cols = [
+        f"{var}__LAG_{lag}"
+        for var in PHENOLOGY_COLS
+        for lag in range(1, MAX_LAG + 1)
+    ]
+
+    keep_cols = [
+        c for c in (ALL_ANALYSIS_BASE_COLS + lag_cols)
+        if c in df.columns
+    ]
     df = df[keep_cols].copy()
 
     # Conversión numérica
@@ -335,13 +352,12 @@ def load_and_prepare_data():
         "SEMANA",
         TARGET_COL,
         *PHENOLOGY_COLS,
-        *CONTROL_COLS,
-        *OPTIONAL_EXTRA_COLS,
+        *lag_cols,
     ]
     df = to_numeric_safe(df, [c for c in numeric_cols if c in df.columns])
 
-    # Cálculo analítico
-    df = add_delta_and_lags(df, lag_max=MAX_LAG)
+    # Solo calcular delta, porque los lags ya existen en la data
+    df = add_delta_only(df)
 
     return df, file_path
 
@@ -362,12 +378,13 @@ with st.expander("Verificación técnica del enfoque usado", expanded=False):
     st.markdown(
         """
 **Cálculo temporal aplicado**
-- Los deltas y lags se calculan por: `CAMPAÑA + FUNDO + ETAPA + CAMPO + TURNO + VARIEDAD`
+- Los deltas se calculan por: `CAMPAÑA + FUNDO + ETAPA + CAMPO + TURNO + VARIEDAD`
 - El orden temporal es: `CAMPAÑA -> AÑO -> SEMANA`
 - `AÑO` se conserva como identificador y filtro, pero no rompe la continuidad temporal dentro de la campaña
-- Solo se calcula delta/lag si la semana previa existe realmente y es consecutiva
+- Solo se calcula delta si la semana previa existe realmente y es consecutiva
 - Si falta una semana intermedia, el valor queda vacío
 - `DELTA_BW_%` queda vacío si el peso previo es nulo o igual a 0
+- Los lags ya no se recalculan: se usan directamente desde la data actual
         """
     )
 
@@ -388,7 +405,7 @@ analysis_target = st.sidebar.selectbox(
     index=0,
 )
 
-base_analysis_vars = PHENOLOGY_COLS + CONTROL_COLS
+base_analysis_vars = PHENOLOGY_COLS
 selected_base_var = st.sidebar.selectbox(
     "Variable explicativa base",
     options=base_analysis_vars,
@@ -413,23 +430,24 @@ outlier_mode = st.sidebar.radio(
 show_trend = st.sidebar.checkbox("Mostrar línea de tendencia lineal", value=True)
 
 # Base para visuales
-viz_df = filtered.copy()
+viz_cols = [
+    *ID_COLS_DISPLAY,
+    "SEMANA ACTUAL",
+    "AÑO-SEMANA ACTUAL",
+    "ENTITY_KEY",
+    TARGET_COL,
+    "DELTA_BW",
+    "DELTA_BW_%",
+    selected_x_col,
+]
+
+viz_cols = [c for c in viz_cols if c in filtered.columns]
+
+viz_df = filtered[viz_cols].copy()
+
 if selected_x_col not in viz_df.columns:
     st.error(f"No existe la columna seleccionada para análisis: {selected_x_col}")
     st.stop()
-
-viz_df = viz_df[
-    [
-        *ID_COLS_DISPLAY,
-        "SEMANA ACTUAL",
-        "AÑO-SEMANA ACTUAL",
-        "ENTITY_KEY",
-        TARGET_COL,
-        "DELTA_BW",
-        "DELTA_BW_%",
-        selected_x_col,
-    ]
-].copy()
 
 if outlier_mode == "Todos excepto outliers":
     valid_mask = iqr_filter_mask(viz_df[analysis_target])
@@ -448,15 +466,14 @@ c4.metric("Delta válido", f"{filtered['DELTA_BW'].notna().sum():,}")
 c5.metric("Delta % válido", f"{filtered['DELTA_BW_%'].notna().sum():,}")
 c6.metric("Filas en visual actual", f"{len(viz_df.dropna(subset=[analysis_target, selected_x_col])):,}")
 
+missing_vars = [TARGET_COL] + PHENOLOGY_COLS + ["DELTA_BW", "DELTA_BW_%"]
+
 missing_summary = pd.DataFrame(
     {
-        "variable": [TARGET_COL] + PHENOLOGY_COLS + CONTROL_COLS + ["DELTA_BW", "DELTA_BW_%"],
+        "variable": missing_vars,
         "faltantes_%": [
-            filtered[TARGET_COL].isna().mean() * 100,
-            *[(filtered[c].isna().mean() * 100) for c in PHENOLOGY_COLS],
-            *[(filtered[c].isna().mean() * 100) for c in CONTROL_COLS],
-            filtered["DELTA_BW"].isna().mean() * 100,
-            filtered["DELTA_BW_%"].isna().mean() * 100,
+            filtered[var].isna().mean() * 100 if var in filtered.columns else np.nan
+            for var in missing_vars
         ],
     }
 ).sort_values("faltantes_%", ascending=False)
@@ -481,21 +498,22 @@ tab1, tab2, tab3 = st.tabs(
 with tab1:
     st.subheader("Scatterplot")
 
-    scatter_df = viz_df[
-        [
-            selected_x_col,
-            analysis_target,
-            "CAMPAÑA",
-            "AÑO",
-            "SEMANA",
-            "SEMANA ACTUAL",
-            "AÑO-SEMANA ACTUAL",
-            "VARIEDAD",
-            "CAMPO",
-            "FUNDO",
-            "ENTITY_KEY",
-        ]
-    ].dropna()
+    scatter_cols = [
+        selected_x_col,
+        analysis_target,
+        "CAMPAÑA",
+        "AÑO",
+        "SEMANA",
+        "SEMANA ACTUAL",
+        "AÑO-SEMANA ACTUAL",
+        "VARIEDAD",
+        "CAMPO",
+        "FUNDO",
+        "ENTITY_KEY",
+    ]
+    scatter_cols = [c for c in scatter_cols if c in viz_df.columns]
+
+    scatter_df = viz_df[scatter_cols].dropna()
 
     if scatter_df.empty:
         st.warning("No hay datos suficientes para el scatterplot con la selección actual.")
@@ -506,14 +524,16 @@ with tab1:
             y=analysis_target,
             color="VARIEDAD",
             hover_data=[
-                "CAMPAÑA",
-                "AÑO",
-                "SEMANA ACTUAL",
-                "AÑO-SEMANA ACTUAL",
-                "FUNDO",
-                "CAMPO",
-                "VARIEDAD",
-                "ENTITY_KEY",
+                c for c in [
+                    "CAMPAÑA",
+                    "AÑO",
+                    "SEMANA ACTUAL",
+                    "AÑO-SEMANA ACTUAL",
+                    "FUNDO",
+                    "CAMPO",
+                    "VARIEDAD",
+                    "ENTITY_KEY",
+                ] if c in scatter_df.columns
             ],
             opacity=0.65,
         )
@@ -542,22 +562,23 @@ with tab1:
 with tab2:
     st.subheader("Boxplot por niveles de la variable rezagada")
 
-    box_df = viz_df[
-        [
-            selected_x_col,
-            analysis_target,
-            "CAMPAÑA",
-            "AÑO",
-            "SEMANA",
-            "SEMANA ACTUAL",
-            "AÑO-SEMANA ACTUAL",
-            "FUNDO",
-            "CAMPO",
-            "TURNO",
-            "VARIEDAD",
-            "ENTITY_KEY",
-        ]
-    ].dropna().copy()
+    box_cols = [
+        selected_x_col,
+        analysis_target,
+        "CAMPAÑA",
+        "AÑO",
+        "SEMANA",
+        "SEMANA ACTUAL",
+        "AÑO-SEMANA ACTUAL",
+        "FUNDO",
+        "CAMPO",
+        "TURNO",
+        "VARIEDAD",
+        "ENTITY_KEY",
+    ]
+    box_cols = [c for c in box_cols if c in viz_df.columns]
+
+    box_df = viz_df[box_cols].dropna().copy()
 
     if len(box_df) < 10:
         st.warning("No hay suficientes datos para construir bins interpretables.")
@@ -571,7 +592,6 @@ with tab2:
                 duplicates="drop",
             )
 
-            # Orden correcto de bins
             ordered_bins = sorted(box_df["BIN_X"].dropna().unique())
             ordered_bin_labels = [str(b) for b in ordered_bins]
             box_df["BIN_X_LABEL"] = pd.Categorical(
@@ -580,7 +600,6 @@ with tab2:
                 ordered=True,
             )
 
-            # Gráfico mejorado: boxplot + puntos
             fig = go.Figure()
 
             for bin_label in ordered_bin_labels:
@@ -634,12 +653,17 @@ with tab2:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # Resumen estadístico por bin
             summary_box = (
                 box_df.groupby("BIN_X_LABEL", dropna=False)[analysis_target]
                 .agg(["count", "mean", "median", "std"])
                 .reset_index()
-                .rename(columns={"BIN_X_LABEL": "GRUPO", "count": "N", "mean": "MEDIA", "median": "MEDIANA", "std": "DESV_STD"})
+                .rename(columns={
+                    "BIN_X_LABEL": "GRUPO",
+                    "count": "N",
+                    "mean": "MEDIA",
+                    "median": "MEDIANA",
+                    "std": "DESV_STD"
+                })
             )
 
             summary_box["CV(%)"] = np.where(
@@ -648,7 +672,6 @@ with tab2:
                 np.nan,
             )
 
-            # Kruskal-Wallis
             kruskal_groups = []
             for grp in ordered_bin_labels:
                 vals = box_df.loc[box_df["BIN_X_LABEL"] == grp, analysis_target].dropna().values
@@ -700,7 +723,11 @@ with tab3:
     if ts_df.empty:
         st.warning("No hay datos para el grupo seleccionado.")
     else:
-        ts_df["EJE_TIEMPO"] = ts_df["AÑO"].astype("Int64").astype(str) + "-W" + ts_df["SEMANA"].astype("Int64").astype(str).str.zfill(2)
+        ts_df["EJE_TIEMPO"] = (
+            ts_df["AÑO"].astype("Int64").astype(str)
+            + "-W"
+            + ts_df["SEMANA"].astype("Int64").astype(str).str.zfill(2)
+        )
 
         fig = go.Figure()
         fig.add_trace(
@@ -789,24 +816,25 @@ with tab3:
 
         st.plotly_chart(fig, use_container_width=True)
 
+        display_cols = [
+            "AÑO",
+            "CAMPAÑA",
+            "SEMANA",
+            "SEMANA ACTUAL",
+            "AÑO-SEMANA ACTUAL",
+            "FUNDO",
+            "ETAPA",
+            "CAMPO",
+            "TURNO",
+            "VARIEDAD",
+            TARGET_COL,
+            "DELTA_BW",
+            "DELTA_BW_%",
+            selected_x_col,
+        ]
+        display_cols = [c for c in display_cols if c in ts_df.columns]
+
         st.dataframe(
-            ts_df[
-                [
-                    "AÑO",
-                    "CAMPAÑA",
-                    "SEMANA",
-                    "SEMANA ACTUAL",
-                    "AÑO-SEMANA ACTUAL",
-                    "FUNDO",
-                    "ETAPA",
-                    "CAMPO",
-                    "TURNO",
-                    "VARIEDAD",
-                    TARGET_COL,
-                    "DELTA_BW",
-                    "DELTA_BW_%",
-                    selected_x_col,
-                ]
-            ],
+            ts_df[display_cols],
             use_container_width=True,
         )
