@@ -91,10 +91,18 @@ PHENOLOGY_COLS = [
     "FRUTO MADURO",
 ]
 
-CONTROL_COLS = []
-OPTIONAL_EXTRA_COLS = []
-
 ALL_ANALYSIS_BASE_COLS = ID_COLS_DISPLAY + PHENOLOGY_COLS + [TARGET_COL, "SEMANA FENOLOGICA"]
+
+ALL_X_TRANSFORM_OPTIONS = [
+    "Original",
+    "log(X+1)",
+    "log(X+1)*log(SF+1)",
+    "X*SF",
+    "sqrt(X)",
+    "sqrt(X)/sqrt(SF)",
+    "log(X+1)^2 * log(SF+1)",
+    "log(X+1)/sqrt(SF)",
+]
 
 
 # =========================================================
@@ -153,6 +161,26 @@ def build_entity_key(df: pd.DataFrame) -> pd.Series:
         + " | " + df["TURNO"].astype("string").fillna("")
         + " | " + df["VARIEDAD"].astype("string").fillna("")
     )
+
+
+def unique_preserve_order(seq):
+    seen = set()
+    out = []
+    for item in seq:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def get_series(df: pd.DataFrame, col: str) -> pd.Series:
+    """
+    Devuelve una Serie incluso si por duplicidad de nombres pandas retorna un DataFrame.
+    """
+    obj = df[col]
+    if isinstance(obj, pd.DataFrame):
+        return obj.iloc[:, 0]
+    return obj
 
 
 def standardize_current_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -269,7 +297,9 @@ def mahalanobis_filter(df: pd.DataFrame, x_col: str, y_col: str, threshold: floa
     Detecta outliers en la relación X vs Y usando distancia de Mahalanobis.
     Se aplica sobre las variables actualmente ploteadas.
     """
-    sub = df[[x_col, y_col]].dropna().copy()
+    x_ser = get_series(df, x_col)
+    y_ser = get_series(df, y_col)
+    sub = pd.DataFrame({x_col: x_ser, y_col: y_ser}).dropna().copy()
 
     if len(sub) < 5:
         return pd.Series(True, index=df.index)
@@ -313,10 +343,6 @@ def apply_sidebar_filters(df: pd.DataFrame) -> pd.DataFrame:
 def transform_x_series(x: pd.Series, semana_fenologica: pd.Series, transform_mode: str) -> pd.Series:
     """
     Transformación del eje X para visualización y ajuste.
-    - Original: x
-    - Log(X): log1p(x) para tolerar ceros
-    - Log(X) × Log(Semana fenológica + 1): log1p(x) * log1p(semana_fenologica)
-    - Raíz cuadrada de Log(X): sqrt(log1p(x))
     """
     x_num = pd.to_numeric(x, errors="coerce")
     semana_num = pd.to_numeric(semana_fenologica, errors="coerce")
@@ -324,18 +350,36 @@ def transform_x_series(x: pd.Series, semana_fenologica: pd.Series, transform_mod
     if transform_mode == "Original":
         return x_num
 
-    if transform_mode == "Log(X)":
+    if transform_mode == "log(X+1)":
         x_num = x_num.where(x_num >= 0, np.nan)
         return np.log1p(x_num)
 
-    if transform_mode == "Log(X) × Log(Semana fenológica + 1)":
+    if transform_mode == "log(X+1)*log(SF+1)":
         x_num = x_num.where(x_num >= 0, np.nan)
         semana_num = semana_num.where(semana_num >= 0, np.nan)
         return np.log1p(x_num) * np.log1p(semana_num)
 
-    if transform_mode == "Raíz(Log(X))":
+    if transform_mode == "X*SF":
+        return x_num * semana_num
+
+    if transform_mode == "sqrt(X)":
         x_num = x_num.where(x_num >= 0, np.nan)
-        return np.sqrt(np.log1p(x_num))
+        return np.sqrt(x_num)
+
+    if transform_mode == "sqrt(X)/sqrt(SF)":
+        x_num = x_num.where(x_num >= 0, np.nan)
+        semana_num = semana_num.where(semana_num > 0, np.nan)
+        return np.sqrt(x_num) / np.sqrt(semana_num)
+
+    if transform_mode == "log(X+1)^2 * log(SF+1)":
+        x_num = x_num.where(x_num >= 0, np.nan)
+        semana_num = semana_num.where(semana_num >= 0, np.nan)
+        return (np.log1p(x_num) ** 2) * np.log1p(semana_num)
+
+    if transform_mode == "log(X+1)/sqrt(SF)":
+        x_num = x_num.where(x_num >= 0, np.nan)
+        semana_num = semana_num.where(semana_num > 0, np.nan)
+        return np.log1p(x_num) / np.sqrt(semana_num)
 
     return x_num
 
@@ -343,13 +387,92 @@ def transform_x_series(x: pd.Series, semana_fenologica: pd.Series, transform_mod
 def get_x_axis_label(base_label: str, transform_mode: str) -> str:
     if transform_mode == "Original":
         return base_label
-    if transform_mode == "Log(X)":
-        return f"log(1 + {base_label})"
-    if transform_mode == "Log(X) × Log(Semana fenológica + 1)":
-        return f"log(1 + {base_label}) × log(1 + SEMANA FENOLOGICA)"
-    if transform_mode == "Raíz(Log(X))":
-        return f"sqrt(log(1 + {base_label}))"
+    if transform_mode == "log(X+1)":
+        return f"log({base_label}+1)"
+    if transform_mode == "log(X+1)*log(SF+1)":
+        return f"log({base_label}+1)*log(SF+1)"
+    if transform_mode == "X*SF":
+        return f"{base_label}*SF"
+    if transform_mode == "sqrt(X)":
+        return f"sqrt({base_label})"
+    if transform_mode == "sqrt(X)/sqrt(SF)":
+        return f"sqrt({base_label})/sqrt(SF)"
+    if transform_mode == "log(X+1)^2 * log(SF+1)":
+        return f"log({base_label}+1)^2 * log(SF+1)"
+    if transform_mode == "log(X+1)/sqrt(SF)":
+        return f"log({base_label}+1)/sqrt(SF)"
     return base_label
+
+
+def build_transform_ranking(df: pd.DataFrame, x_col: str, y_col: str, semana_col: str = "SEMANA FENOLOGICA") -> pd.DataFrame:
+    """
+    Calcula Pearson para las 8 transformaciones del eje X y devuelve
+    un ranking de mayor a menor según |Pearson|.
+    """
+    rows = []
+
+    if x_col not in df.columns or y_col not in df.columns or semana_col not in df.columns:
+        return pd.DataFrame(
+            columns=["ranking", "transformacion", "n", "pearson", "pearson_abs", "direccion"]
+        )
+
+    x_base = get_series(df, x_col)
+    semana = get_series(df, semana_col)
+    y = pd.to_numeric(get_series(df, y_col), errors="coerce")
+
+    for mode in ALL_X_TRANSFORM_OPTIONS:
+        x_trans = transform_x_series(
+            x=x_base,
+            semana_fenologica=semana,
+            transform_mode=mode,
+        )
+
+        sub = pd.DataFrame(
+            {
+                "X_TRANS": pd.to_numeric(x_trans, errors="coerce"),
+                "Y": y,
+            }
+        ).dropna()
+
+        n = len(sub)
+
+        if n < 2 or sub["X_TRANS"].nunique(dropna=True) < 2 or sub["Y"].nunique(dropna=True) < 2:
+            pearson = np.nan
+        else:
+            try:
+                pearson = sub["X_TRANS"].corr(sub["Y"], method="pearson")
+            except Exception:
+                pearson = np.nan
+
+        rows.append(
+            {
+                "transformacion": mode,
+                "n": n,
+                "pearson": pearson,
+                "pearson_abs": abs(pearson) if pd.notna(pearson) else np.nan,
+                "direccion": (
+                    "Positiva" if pd.notna(pearson) and pearson > 0
+                    else "Negativa" if pd.notna(pearson) and pearson < 0
+                    else "Nula/NA"
+                ),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+
+    if out.empty:
+        return pd.DataFrame(
+            columns=["ranking", "transformacion", "n", "pearson", "pearson_abs", "direccion"]
+        )
+
+    out = out.sort_values(
+        ["pearson_abs", "n"],
+        ascending=[False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    out.insert(0, "ranking", np.arange(1, len(out) + 1))
+    return out
 
 
 def add_model(fig, x: pd.Series, y: pd.Series, model_type: str):
@@ -426,7 +549,15 @@ def compute_group_stability(df: pd.DataFrame, group_col: str, x_col: str, y_col:
     Calcula estabilidad de la relación x vs y por grupo.
     Devuelve n, Pearson y Spearman por cada campaña o variedad.
     """
-    work = df[[group_col, x_col, y_col]].copy().dropna()
+    x_ser = get_series(df, x_col)
+    y_ser = get_series(df, y_col)
+    g_ser = get_series(df, group_col)
+
+    work = pd.DataFrame({
+        group_col: g_ser,
+        x_col: x_ser,
+        y_col: y_ser,
+    }).dropna()
 
     if work.empty:
         return pd.DataFrame(columns=[group_col, "n", "pearson", "spearman", "abs_pearson", "abs_spearman"])
@@ -494,6 +625,8 @@ def build_findings_summary(df: pd.DataFrame, analysis_target: str, max_lag: int)
     """
     rows = []
 
+    y_ser = get_series(df, analysis_target)
+
     # Variables fenológicas con lags
     for base_var in PHENOLOGY_COLS:
         best_row = None
@@ -504,7 +637,8 @@ def build_findings_summary(df: pd.DataFrame, analysis_target: str, max_lag: int)
             if x_col not in df.columns:
                 continue
 
-            sub = df[[x_col, analysis_target]].dropna()
+            x_ser = get_series(df, x_col)
+            sub = pd.DataFrame({x_col: x_ser, analysis_target: y_ser}).dropna()
             n = len(sub)
 
             if n < 8:
@@ -532,7 +666,8 @@ def build_findings_summary(df: pd.DataFrame, analysis_target: str, max_lag: int)
 
     # Semana fenológica
     if "SEMANA FENOLOGICA" in df.columns:
-        sub = df[["SEMANA FENOLOGICA", analysis_target]].dropna()
+        x_ser = get_series(df, "SEMANA FENOLOGICA")
+        sub = pd.DataFrame({"SEMANA FENOLOGICA": x_ser, analysis_target: y_ser}).dropna()
         if len(sub) >= 8:
             pearson = sub["SEMANA FENOLOGICA"].corr(sub[analysis_target], method="pearson")
             spearman = sub["SEMANA FENOLOGICA"].corr(sub[analysis_target], method="spearman")
@@ -549,7 +684,8 @@ def build_findings_summary(df: pd.DataFrame, analysis_target: str, max_lag: int)
 
     # Peso suavizado lag 1
     if "PESO_BAYA_SUAVIZADO__LAG_1" in df.columns:
-        sub = df[["PESO_BAYA_SUAVIZADO__LAG_1", analysis_target]].dropna()
+        x_ser = get_series(df, "PESO_BAYA_SUAVIZADO__LAG_1")
+        sub = pd.DataFrame({"PESO_BAYA_SUAVIZADO__LAG_1": x_ser, analysis_target: y_ser}).dropna()
         if len(sub) >= 8:
             pearson = sub["PESO_BAYA_SUAVIZADO__LAG_1"].corr(sub[analysis_target], method="pearson")
             spearman = sub["PESO_BAYA_SUAVIZADO__LAG_1"].corr(sub[analysis_target], method="spearman")
@@ -602,6 +738,7 @@ def load_and_prepare_data():
         c for c in (ALL_ANALYSIS_BASE_COLS + lag_cols)
         if c in df.columns
     ]
+    keep_cols = unique_preserve_order(keep_cols)
     df = df[keep_cols].copy()
 
     # Conversión numérica
@@ -646,7 +783,15 @@ with st.expander("Verificación técnica del enfoque usado", expanded=False):
 - Los lags ya no se recalculan: se usan directamente desde la data actual
 - Se aplica suavizado de 3 semanas al peso antes de calcular el delta
 - También se construye `PESO_BAYA_SUAVIZADO__LAG_1` como opción adicional del eje X
-- Se puede transformar X con `log(1 + X)`, con `log(1 + X) × log(1 + SEMANA FENOLOGICA)` o con `sqrt(log(1 + X))`
+- Se puede transformar X con:
+  - `Original`
+  - `log(X+1)`
+  - `log(X+1)*log(SF+1)`
+  - `X*SF`
+  - `sqrt(X)`
+  - `sqrt(X)/sqrt(SF)`
+  - `log(X+1)^2 * log(SF+1)`
+  - `log(X+1)/sqrt(SF)`
         """
     )
 
@@ -705,12 +850,7 @@ elif x_source_mode == "Peso suavizado lag 1":
 
 x_transform_mode = st.sidebar.radio(
     "Transformación del eje X",
-    options=[
-        "Original",
-        "Log(X)",
-        "Log(X) × Log(Semana fenológica + 1)",
-        "Raíz(Log(X))",
-    ],
+    options=ALL_X_TRANSFORM_OPTIONS,
     index=0,
 )
 
@@ -750,8 +890,7 @@ viz_cols = [
     "DELTA_BW_%",
     selected_x_col,
 ]
-
-viz_cols = [c for c in viz_cols if c in filtered.columns]
+viz_cols = unique_preserve_order([c for c in viz_cols if c in filtered.columns])
 viz_df = filtered[viz_cols].copy()
 
 if selected_x_col not in viz_df.columns:
@@ -759,20 +898,21 @@ if selected_x_col not in viz_df.columns:
     st.stop()
 
 if "SEMANA FENOLOGICA" not in viz_df.columns:
-    st.error("No existe la columna 'SEMANA FENOLOGICA', necesaria para la transformación con semana fenológica.")
+    st.error("No existe la columna 'SEMANA FENOLOGICA', necesaria para las transformaciones con semana fenológica.")
     st.stop()
 
 # Filtro por lag solo si aplica
 if x_source_mode == "Variable fenológica rezagada" and lag_filter is not None:
+    x_tmp = get_series(viz_df, selected_x_col)
     if lag_filter == "Solo lag = 0":
-        viz_df = viz_df[viz_df[selected_x_col] == 0]
+        viz_df = viz_df[x_tmp == 0].copy()
     elif lag_filter == "Solo lag > 0":
-        viz_df = viz_df[viz_df[selected_x_col] > 0]
+        viz_df = viz_df[x_tmp > 0].copy()
 
 # Transformación para análisis y gráficos
 viz_df["X_PLOT"] = transform_x_series(
-    x=viz_df[selected_x_col],
-    semana_fenologica=viz_df["SEMANA FENOLOGICA"],
+    x=get_series(viz_df, selected_x_col),
+    semana_fenologica=get_series(viz_df, "SEMANA FENOLOGICA"),
     transform_mode=x_transform_mode,
 )
 x_axis_label = get_x_axis_label(selected_x_col, x_transform_mode)
@@ -813,12 +953,13 @@ with st.expander("Ver porcentaje de faltantes por variable", expanded=False):
 # =========================================================
 # TABS
 # =========================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
         "Scatterplot",
         "Boxplot",
         "Series temporales",
         "Estabilidad",
+        "Ranking transformaciones",
         "Resumen de hallazgos",
     ]
 )
@@ -829,7 +970,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 with tab1:
     st.subheader("Scatterplot")
 
-    scatter_cols = [
+    scatter_cols = unique_preserve_order([
         selected_x_col,
         "X_PLOT",
         "SEMANA FENOLOGICA",
@@ -843,7 +984,7 @@ with tab1:
         "CAMPO",
         "FUNDO",
         "ENTITY_KEY",
-    ]
+    ])
     scatter_cols = [c for c in scatter_cols if c in viz_df.columns]
 
     scatter_df = viz_df[scatter_cols].dropna()
@@ -874,7 +1015,7 @@ with tab1:
         )
 
         if show_trend:
-            fig = add_model(fig, scatter_df["X_PLOT"], scatter_df[analysis_target], model_type)
+            fig = add_model(fig, get_series(scatter_df, "X_PLOT"), get_series(scatter_df, analysis_target), model_type)
 
         fig.update_layout(
             xaxis_title=x_axis_label,
@@ -883,8 +1024,11 @@ with tab1:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        corr_p = scatter_df["X_PLOT"].corr(scatter_df[analysis_target], method="pearson")
-        corr_s = scatter_df["X_PLOT"].corr(scatter_df[analysis_target], method="spearman")
+        x_metric = get_series(scatter_df, "X_PLOT")
+        y_metric = get_series(scatter_df, analysis_target)
+
+        corr_p = x_metric.corr(y_metric, method="pearson")
+        corr_s = x_metric.corr(y_metric, method="spearman")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("n", f"{len(scatter_df):,}")
@@ -897,7 +1041,7 @@ with tab1:
 with tab2:
     st.subheader("Boxplot por niveles de la variable del eje X")
 
-    box_cols = [
+    box_cols = unique_preserve_order([
         selected_x_col,
         "X_PLOT",
         "SEMANA FENOLOGICA",
@@ -912,7 +1056,7 @@ with tab2:
         "TURNO",
         "VARIEDAD",
         "ENTITY_KEY",
-    ]
+    ])
     box_cols = [c for c in box_cols if c in viz_df.columns]
 
     box_df = viz_df[box_cols].dropna().copy()
@@ -924,7 +1068,7 @@ with tab2:
             n_bins = st.slider("Número de bins", min_value=4, max_value=10, value=5, key="bins_slider")
 
             box_df["BIN_X"] = pd.qcut(
-                box_df["X_PLOT"],
+                get_series(box_df, "X_PLOT"),
                 q=n_bins,
                 duplicates="drop",
             )
@@ -944,7 +1088,7 @@ with tab2:
 
                 fig.add_trace(
                     go.Box(
-                        y=sub[analysis_target],
+                        y=get_series(sub, analysis_target),
                         x=[bin_label] * len(sub),
                         name=bin_label,
                         boxpoints="all",
@@ -954,17 +1098,17 @@ with tab2:
                         line=dict(width=1.5),
                         customdata=np.stack(
                             [
-                                sub["SEMANA ACTUAL"].astype(str),
-                                sub["AÑO-SEMANA ACTUAL"].astype(str),
-                                sub["CAMPAÑA"].astype(str),
-                                sub["FUNDO"].astype(str),
-                                sub["CAMPO"].astype(str),
-                                sub["TURNO"].astype(str),
-                                sub["VARIEDAD"].astype(str),
-                                sub["ENTITY_KEY"].astype(str),
-                                sub[selected_x_col].astype(float),
-                                sub["SEMANA FENOLOGICA"].astype(float),
-                                sub["X_PLOT"].astype(float),
+                                get_series(sub, "SEMANA ACTUAL").astype(str),
+                                get_series(sub, "AÑO-SEMANA ACTUAL").astype(str),
+                                get_series(sub, "CAMPAÑA").astype(str),
+                                get_series(sub, "FUNDO").astype(str),
+                                get_series(sub, "CAMPO").astype(str),
+                                get_series(sub, "TURNO").astype(str),
+                                get_series(sub, "VARIEDAD").astype(str),
+                                get_series(sub, "ENTITY_KEY").astype(str),
+                                pd.to_numeric(get_series(sub, selected_x_col), errors="coerce").astype(float),
+                                pd.to_numeric(get_series(sub, "SEMANA FENOLOGICA"), errors="coerce").astype(float),
+                                pd.to_numeric(get_series(sub, "X_PLOT"), errors="coerce").astype(float),
                             ],
                             axis=-1,
                         ),
@@ -1073,14 +1217,14 @@ with tab3:
         fig = go.Figure()
         fig.add_trace(
             go.Scatter(
-                x=ts_df["EJE_TIEMPO"],
-                y=ts_df[TARGET_COL],
+                x=get_series(ts_df, "EJE_TIEMPO"),
+                y=get_series(ts_df, TARGET_COL),
                 mode="lines+markers",
                 name=TARGET_COL,
                 customdata=np.stack(
                     [
-                        ts_df["SEMANA ACTUAL"].astype(str),
-                        ts_df["AÑO-SEMANA ACTUAL"].astype(str),
+                        get_series(ts_df, "SEMANA ACTUAL").astype(str),
+                        get_series(ts_df, "AÑO-SEMANA ACTUAL").astype(str),
                     ],
                     axis=-1,
                 ),
@@ -1093,15 +1237,15 @@ with tab3:
         )
         fig.add_trace(
             go.Scatter(
-                x=ts_df["EJE_TIEMPO"],
-                y=ts_df["DELTA_BW"],
+                x=get_series(ts_df, "EJE_TIEMPO"),
+                y=get_series(ts_df, "DELTA_BW"),
                 mode="lines+markers",
                 name="DELTA_BW",
                 yaxis="y2",
                 customdata=np.stack(
                     [
-                        ts_df["SEMANA ACTUAL"].astype(str),
-                        ts_df["AÑO-SEMANA ACTUAL"].astype(str),
+                        get_series(ts_df, "SEMANA ACTUAL").astype(str),
+                        get_series(ts_df, "AÑO-SEMANA ACTUAL").astype(str),
                     ],
                     axis=-1,
                 ),
@@ -1116,15 +1260,15 @@ with tab3:
         if selected_x_col in ts_df.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=ts_df["EJE_TIEMPO"],
-                    y=ts_df[selected_x_col],
+                    x=get_series(ts_df, "EJE_TIEMPO"),
+                    y=get_series(ts_df, selected_x_col),
                     mode="lines+markers",
                     name=selected_x_col,
                     yaxis="y3",
                     customdata=np.stack(
                         [
-                            ts_df["SEMANA ACTUAL"].astype(str),
-                            ts_df["AÑO-SEMANA ACTUAL"].astype(str),
+                            get_series(ts_df, "SEMANA ACTUAL").astype(str),
+                            get_series(ts_df, "AÑO-SEMANA ACTUAL").astype(str),
                         ],
                         axis=-1,
                     ),
@@ -1157,7 +1301,7 @@ with tab3:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        display_cols = [
+        display_cols = unique_preserve_order([
             "AÑO",
             "CAMPAÑA",
             "SEMANA",
@@ -1175,7 +1319,7 @@ with tab3:
             "DELTA_BW",
             "DELTA_BW_%",
             selected_x_col,
-        ]
+        ])
         display_cols = [c for c in display_cols if c in ts_df.columns]
 
         st.dataframe(
@@ -1270,9 +1414,77 @@ with tab4:
                 st.plotly_chart(fig, use_container_width=True)
 
 # =========================================================
-# TAB 5: RESUMEN DE HALLAZGOS
+# TAB 5: RANKING TRANSFORMACIONES
 # =========================================================
 with tab5:
+    st.subheader("Ranking de transformaciones del eje X")
+    st.caption("Compara dinámicamente las 8 transformaciones usando la correlación de Pearson y las ordena de mejor a peor según |Pearson|.")
+
+    ranking_base_cols = unique_preserve_order([
+        selected_x_col,
+        "SEMANA FENOLOGICA",
+        analysis_target,
+    ])
+    ranking_base_cols = [c for c in ranking_base_cols if c in viz_df.columns]
+
+    ranking_df = viz_df[ranking_base_cols].copy()
+
+    ranking_results = build_transform_ranking(
+        df=ranking_df,
+        x_col=selected_x_col,
+        y_col=analysis_target,
+        semana_col="SEMANA FENOLOGICA",
+    )
+
+    if ranking_results.empty:
+        st.warning("No hay datos suficientes para construir el ranking de transformaciones.")
+    else:
+        top_row = ranking_results.iloc[0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Mejor transformación", str(top_row["transformacion"]))
+        c2.metric("|Pearson|", f"{top_row['pearson_abs']:.4f}" if pd.notna(top_row["pearson_abs"]) else "NA")
+        c3.metric("Pearson real", f"{top_row['pearson']:.4f}" if pd.notna(top_row["pearson"]) else "NA")
+        c4.metric("n", f"{int(top_row['n']):,}")
+
+        disp = ranking_results.copy()
+        for col in ["pearson", "pearson_abs"]:
+            if col in disp.columns:
+                disp[col] = disp[col].round(4)
+
+        st.dataframe(
+            disp[["ranking", "transformacion", "n", "pearson", "pearson_abs", "direccion"]],
+            use_container_width=True,
+        )
+
+        plot_df = ranking_results.dropna(subset=["pearson_abs"]).copy()
+        if not plot_df.empty:
+            fig = px.bar(
+                plot_df.sort_values("pearson_abs", ascending=False),
+                x="transformacion",
+                y="pearson_abs",
+                text="n",
+                title="Ranking de transformaciones por |Pearson|",
+                color="direccion",
+            )
+            fig.update_layout(
+                height=500,
+                xaxis_title="Transformación",
+                yaxis_title="|Pearson|",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.info(
+            f"Con los filtros actuales, la transformación con mejor desempeño es **{top_row['transformacion']}**, "
+            f"con un Pearson de **{top_row['pearson']:.4f}** y una magnitud **|Pearson| = {top_row['pearson_abs']:.4f}**."
+            if pd.notna(top_row["pearson"]) and pd.notna(top_row["pearson_abs"])
+            else f"Con los filtros actuales, la transformación con mejor desempeño es **{top_row['transformacion']}**."
+        )
+
+# =========================================================
+# TAB 6: RESUMEN DE HALLAZGOS
+# =========================================================
+with tab6:
     st.subheader("Resumen de hallazgos")
     st.caption("Resumen cuantitativo para identificar qué variable muestra la señal más fuerte frente al delta semanal.")
 
