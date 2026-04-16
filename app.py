@@ -310,13 +310,16 @@ def apply_sidebar_filters(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
-def transform_x_series(x: pd.Series, transform_mode: str) -> pd.Series:
+def transform_x_series(x: pd.Series, semana_fenologica: pd.Series, transform_mode: str) -> pd.Series:
     """
     Transformación del eje X para visualización y ajuste.
     - Original: x
     - Log(X): log1p(x) para tolerar ceros
+    - Log(X) × Log(Semana fenológica + 1): log1p(x) * log1p(semana_fenologica)
+    - Raíz cuadrada de Log(X): sqrt(log1p(x))
     """
     x_num = pd.to_numeric(x, errors="coerce")
+    semana_num = pd.to_numeric(semana_fenologica, errors="coerce")
 
     if transform_mode == "Original":
         return x_num
@@ -324,6 +327,15 @@ def transform_x_series(x: pd.Series, transform_mode: str) -> pd.Series:
     if transform_mode == "Log(X)":
         x_num = x_num.where(x_num >= 0, np.nan)
         return np.log1p(x_num)
+
+    if transform_mode == "Log(X) × Log(Semana fenológica + 1)":
+        x_num = x_num.where(x_num >= 0, np.nan)
+        semana_num = semana_num.where(semana_num >= 0, np.nan)
+        return np.log1p(x_num) * np.log1p(semana_num)
+
+    if transform_mode == "Raíz(Log(X))":
+        x_num = x_num.where(x_num >= 0, np.nan)
+        return np.sqrt(np.log1p(x_num))
 
     return x_num
 
@@ -333,6 +345,10 @@ def get_x_axis_label(base_label: str, transform_mode: str) -> str:
         return base_label
     if transform_mode == "Log(X)":
         return f"log(1 + {base_label})"
+    if transform_mode == "Log(X) × Log(Semana fenológica + 1)":
+        return f"log(1 + {base_label}) × log(1 + SEMANA FENOLOGICA)"
+    if transform_mode == "Raíz(Log(X))":
+        return f"sqrt(log(1 + {base_label}))"
     return base_label
 
 
@@ -630,7 +646,7 @@ with st.expander("Verificación técnica del enfoque usado", expanded=False):
 - Los lags ya no se recalculan: se usan directamente desde la data actual
 - Se aplica suavizado de 3 semanas al peso antes de calcular el delta
 - También se construye `PESO_BAYA_SUAVIZADO__LAG_1` como opción adicional del eje X
-- Se puede transformar X con `log(1 + X)` para linealizar parcialmente relaciones no lineales
+- Se puede transformar X con `log(1 + X)`, con `log(1 + X) × log(1 + SEMANA FENOLOGICA)` o con `sqrt(log(1 + X))`
         """
     )
 
@@ -689,7 +705,12 @@ elif x_source_mode == "Peso suavizado lag 1":
 
 x_transform_mode = st.sidebar.radio(
     "Transformación del eje X",
-    options=["Original", "Log(X)"],
+    options=[
+        "Original",
+        "Log(X)",
+        "Log(X) × Log(Semana fenológica + 1)",
+        "Raíz(Log(X))",
+    ],
     index=0,
 )
 
@@ -737,6 +758,10 @@ if selected_x_col not in viz_df.columns:
     st.error(f"No existe la columna seleccionada para análisis: {selected_x_col}")
     st.stop()
 
+if "SEMANA FENOLOGICA" not in viz_df.columns:
+    st.error("No existe la columna 'SEMANA FENOLOGICA', necesaria para la transformación con semana fenológica.")
+    st.stop()
+
 # Filtro por lag solo si aplica
 if x_source_mode == "Variable fenológica rezagada" and lag_filter is not None:
     if lag_filter == "Solo lag = 0":
@@ -745,7 +770,11 @@ if x_source_mode == "Variable fenológica rezagada" and lag_filter is not None:
         viz_df = viz_df[viz_df[selected_x_col] > 0]
 
 # Transformación para análisis y gráficos
-viz_df["X_PLOT"] = transform_x_series(viz_df[selected_x_col], x_transform_mode)
+viz_df["X_PLOT"] = transform_x_series(
+    x=viz_df[selected_x_col],
+    semana_fenologica=viz_df["SEMANA FENOLOGICA"],
+    transform_mode=x_transform_mode,
+)
 x_axis_label = get_x_axis_label(selected_x_col, x_transform_mode)
 
 # Outliers por Mahalanobis según la visual actual
@@ -803,6 +832,7 @@ with tab1:
     scatter_cols = [
         selected_x_col,
         "X_PLOT",
+        "SEMANA FENOLOGICA",
         analysis_target,
         "CAMPAÑA",
         "AÑO",
@@ -837,6 +867,7 @@ with tab1:
                     "VARIEDAD",
                     "ENTITY_KEY",
                     selected_x_col,
+                    "SEMANA FENOLOGICA",
                 ] if c in scatter_df.columns
             ],
             opacity=0.65,
@@ -869,6 +900,7 @@ with tab2:
     box_cols = [
         selected_x_col,
         "X_PLOT",
+        "SEMANA FENOLOGICA",
         analysis_target,
         "CAMPAÑA",
         "AÑO",
@@ -931,6 +963,7 @@ with tab2:
                                 sub["VARIEDAD"].astype(str),
                                 sub["ENTITY_KEY"].astype(str),
                                 sub[selected_x_col].astype(float),
+                                sub["SEMANA FENOLOGICA"].astype(float),
                                 sub["X_PLOT"].astype(float),
                             ],
                             axis=-1,
@@ -946,7 +979,8 @@ with tab2:
                             "TURNO: %{customdata[5]}<br>"
                             "VARIEDAD: %{customdata[6]}<br>"
                             f"{selected_x_col}: %{{customdata[8]:.4f}}<br>"
-                            f"{x_axis_label}: %{{customdata[9]:.4f}}<br>"
+                            "SEMANA FENOLOGICA: %{customdata[9]:.4f}<br>"
+                            f"{x_axis_label}: %{{customdata[10]:.4f}}<br>"
                             "ENTITY_KEY: %{customdata[7]}<extra></extra>"
                         ),
                     )
