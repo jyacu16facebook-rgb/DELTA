@@ -6,9 +6,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from scipy.stats import kruskal
-from scipy.spatial.distance import mahalanobis
 from scipy.optimize import curve_fit
+from scipy.spatial.distance import mahalanobis
+from scipy.stats import kruskal
 
 
 # =========================================================
@@ -32,6 +32,7 @@ CURRENT_TO_INTERNAL = {
     "año": "AÑO",
     "campaña": "CAMPAÑA",
     "semana": "SEMANA",
+    "semana fenologica": "SEMANA FENOLOGICA",
     "fundo": "FUNDO",
     "etapa": "ETAPA",
     "campo": "CAMPO",
@@ -93,7 +94,7 @@ PHENOLOGY_COLS = [
 CONTROL_COLS = []
 OPTIONAL_EXTRA_COLS = []
 
-ALL_ANALYSIS_BASE_COLS = ID_COLS_DISPLAY + PHENOLOGY_COLS + [TARGET_COL]
+ALL_ANALYSIS_BASE_COLS = ID_COLS_DISPLAY + PHENOLOGY_COLS + [TARGET_COL, "SEMANA FENOLOGICA"]
 
 
 # =========================================================
@@ -197,6 +198,7 @@ def add_delta_only(df: pd.DataFrame) -> pd.DataFrame:
     Calcula DELTA_BW y DELTA_BW_%.
     No recalcula lags porque la data actual ya los trae.
     Aplica suavizado de 3 semanas al TARGET antes del delta.
+    Además crea el peso suavizado lag 1 para usarlo como eje X opcional.
     """
     df = df.copy()
 
@@ -233,7 +235,8 @@ def add_delta_only(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby(ENTITY_COLS, dropna=False, sort=False)
 
     # SUAVIZADO antes del cálculo del delta
-    df[TARGET_COL] = g[TARGET_COL].transform(smooth_series)
+    df["PESO_BAYA_SUAVIZADO"] = g[TARGET_COL].transform(smooth_series)
+    df[TARGET_COL] = df["PESO_BAYA_SUAVIZADO"]
 
     prev_weight = g[TARGET_COL].shift(1)
     prev_week_date = g["WEEK_START_DATE"].shift(1)
@@ -256,26 +259,9 @@ def add_delta_only(df: pd.DataFrame) -> pd.DataFrame:
         np.nan,
     )
 
+    df["PESO_BAYA_SUAVIZADO__LAG_1"] = g["PESO_BAYA_SUAVIZADO"].shift(1)
     df["ENTITY_KEY"] = build_entity_key(df)
     return df
-
-
-def iqr_filter_mask(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    valid = s.dropna()
-    if valid.empty:
-        return pd.Series(False, index=series.index)
-
-    q1 = valid.quantile(0.25)
-    q3 = valid.quantile(0.75)
-    iqr = q3 - q1
-
-    if pd.isna(iqr) or iqr == 0:
-        return s.notna()
-
-    lower = q1 - 1.5 * iqr
-    upper = q3 + 1.5 * iqr
-    return s.between(lower, upper, inclusive="both")
 
 
 def mahalanobis_filter(df: pd.DataFrame, x_col: str, y_col: str, threshold: float = 3.0) -> pd.Series:
@@ -324,33 +310,30 @@ def apply_sidebar_filters(df: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
-def add_trendline(fig, x: pd.Series, y: pd.Series, name: str = "Tendencia lineal"):
+def transform_x_series(x: pd.Series, transform_mode: str) -> pd.Series:
+    """
+    Transformación del eje X para visualización y ajuste.
+    - Original: x
+    - Log(X): log1p(x) para tolerar ceros
+    """
     x_num = pd.to_numeric(x, errors="coerce")
-    y_num = pd.to_numeric(y, errors="coerce")
-    valid = x_num.notna() & y_num.notna()
 
-    if valid.sum() < 2:
-        return fig
+    if transform_mode == "Original":
+        return x_num
 
-    x_v = x_num[valid].values
-    y_v = y_num[valid].values
+    if transform_mode == "Log(X)":
+        x_num = x_num.where(x_num >= 0, np.nan)
+        return np.log1p(x_num)
 
-    if len(np.unique(x_v)) < 2:
-        return fig
+    return x_num
 
-    coef = np.polyfit(x_v, y_v, 1)
-    x_line = np.linspace(x_v.min(), x_v.max(), 100)
-    y_line = coef[0] * x_line + coef[1]
 
-    fig.add_trace(
-        go.Scatter(
-            x=x_line,
-            y=y_line,
-            mode="lines",
-            name=name,
-        )
-    )
-    return fig
+def get_x_axis_label(base_label: str, transform_mode: str) -> str:
+    if transform_mode == "Original":
+        return base_label
+    if transform_mode == "Log(X)":
+        return f"log(1 + {base_label})"
+    return base_label
 
 
 def add_model(fig, x: pd.Series, y: pd.Series, model_type: str):
@@ -391,8 +374,12 @@ def add_model(fig, x: pd.Series, y: pd.Series, model_type: str):
 
         try:
             L0 = np.nanmax(y_v)
+            if not np.isfinite(L0):
+                return fig
+
             k0 = 0.01
             x00 = np.nanmedian(x_v)
+
             popt, _ = curve_fit(
                 logistic,
                 x_v,
@@ -423,8 +410,7 @@ def compute_group_stability(df: pd.DataFrame, group_col: str, x_col: str, y_col:
     Calcula estabilidad de la relación x vs y por grupo.
     Devuelve n, Pearson y Spearman por cada campaña o variedad.
     """
-    work = df[[group_col, x_col, y_col]].copy()
-    work = work.dropna()
+    work = df[[group_col, x_col, y_col]].copy().dropna()
 
     if work.empty:
         return pd.DataFrame(columns=[group_col, "n", "pearson", "spearman", "abs_pearson", "abs_spearman"])
@@ -474,18 +460,26 @@ def compute_group_stability(df: pd.DataFrame, group_col: str, x_col: str, y_col:
 
     out = pd.DataFrame(rows)
     if not out.empty:
-        out = out.sort_values(["abs_spearman", "abs_pearson", "n"], ascending=[False, False, False], na_position="last")
+        out = out.sort_values(
+            ["abs_spearman", "abs_pearson", "n"],
+            ascending=[False, False, False],
+            na_position="last",
+        )
     return out
 
 
-def build_findings_summary(df: pd.DataFrame, analysis_target: str, base_vars: list[str], max_lag: int) -> pd.DataFrame:
+def build_findings_summary(df: pd.DataFrame, analysis_target: str, max_lag: int) -> pd.DataFrame:
     """
-    Resume, para cada variable base, cuál fue el mejor lag
-    según |Spearman| y reporta también Pearson y n.
+    Resume:
+    - mejor lag por variable fenológica
+    - semana fenológica
+    - peso suavizado lag 1
+    según |Spearman|
     """
     rows = []
 
-    for base_var in base_vars:
+    # Variables fenológicas con lags
+    for base_var in PHENOLOGY_COLS:
         best_row = None
         best_score = -np.inf
 
@@ -507,9 +501,10 @@ def build_findings_summary(df: pd.DataFrame, analysis_target: str, base_vars: li
             if score > best_score:
                 best_score = score
                 best_row = {
+                    "tipo_x": "Variable fenológica rezagada",
                     "variable_base": base_var,
                     "mejor_lag": lag,
-                    "columna_lag": x_col,
+                    "columna_x": x_col,
                     "n": n,
                     "pearson": pearson,
                     "spearman": spearman,
@@ -519,10 +514,48 @@ def build_findings_summary(df: pd.DataFrame, analysis_target: str, base_vars: li
         if best_row is not None:
             rows.append(best_row)
 
-    if not rows:
-        return pd.DataFrame(columns=["variable_base", "mejor_lag", "columna_lag", "n", "pearson", "spearman", "abs_spearman"])
+    # Semana fenológica
+    if "SEMANA FENOLOGICA" in df.columns:
+        sub = df[["SEMANA FENOLOGICA", analysis_target]].dropna()
+        if len(sub) >= 8:
+            pearson = sub["SEMANA FENOLOGICA"].corr(sub[analysis_target], method="pearson")
+            spearman = sub["SEMANA FENOLOGICA"].corr(sub[analysis_target], method="spearman")
+            rows.append({
+                "tipo_x": "Semana fenológica",
+                "variable_base": "SEMANA FENOLOGICA",
+                "mejor_lag": np.nan,
+                "columna_x": "SEMANA FENOLOGICA",
+                "n": len(sub),
+                "pearson": pearson,
+                "spearman": spearman,
+                "abs_spearman": abs(spearman) if pd.notna(spearman) else np.nan,
+            })
 
-    out = pd.DataFrame(rows).sort_values(["abs_spearman", "n"], ascending=[False, False]).reset_index(drop=True)
+    # Peso suavizado lag 1
+    if "PESO_BAYA_SUAVIZADO__LAG_1" in df.columns:
+        sub = df[["PESO_BAYA_SUAVIZADO__LAG_1", analysis_target]].dropna()
+        if len(sub) >= 8:
+            pearson = sub["PESO_BAYA_SUAVIZADO__LAG_1"].corr(sub[analysis_target], method="pearson")
+            spearman = sub["PESO_BAYA_SUAVIZADO__LAG_1"].corr(sub[analysis_target], method="spearman")
+            rows.append({
+                "tipo_x": "Peso suavizado lag 1",
+                "variable_base": "PESO_BAYA_SUAVIZADO__LAG_1",
+                "mejor_lag": np.nan,
+                "columna_x": "PESO_BAYA_SUAVIZADO__LAG_1",
+                "n": len(sub),
+                "pearson": pearson,
+                "spearman": spearman,
+                "abs_spearman": abs(spearman) if pd.notna(spearman) else np.nan,
+            })
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["tipo_x", "variable_base", "mejor_lag", "columna_x", "n", "pearson", "spearman", "abs_spearman"]
+        )
+
+    out = pd.DataFrame(rows).sort_values(
+        ["abs_spearman", "n"], ascending=[False, False]
+    ).reset_index(drop=True)
     return out
 
 
@@ -559,6 +592,7 @@ def load_and_prepare_data():
     numeric_cols = [
         "AÑO",
         "SEMANA",
+        "SEMANA FENOLOGICA",
         TARGET_COL,
         *PHENOLOGY_COLS,
         *lag_cols,
@@ -595,6 +629,8 @@ with st.expander("Verificación técnica del enfoque usado", expanded=False):
 - `DELTA_BW_%` queda vacío si el peso previo es nulo o igual a 0
 - Los lags ya no se recalculan: se usan directamente desde la data actual
 - Se aplica suavizado de 3 semanas al peso antes de calcular el delta
+- También se construye `PESO_BAYA_SUAVIZADO__LAG_1` como opción adicional del eje X
+- Se puede transformar X con `log(1 + X)` para linealizar parcialmente relaciones no lineales
         """
     )
 
@@ -615,43 +651,69 @@ analysis_target = st.sidebar.selectbox(
     index=0,
 )
 
-base_analysis_vars = PHENOLOGY_COLS
-selected_base_var = st.sidebar.selectbox(
-    "Variable explicativa base",
-    options=base_analysis_vars,
-    index=base_analysis_vars.index("FRUTO VERDE") if "FRUTO VERDE" in base_analysis_vars else 0,
-)
-
-selected_lag = st.sidebar.slider(
-    "Lag a visualizar",
-    min_value=1,
-    max_value=MAX_LAG,
-    value=1,
-)
-
-selected_x_col = f"{selected_base_var}__LAG_{selected_lag}"
-
-# NUEVO: filtro por lag
-lag_filter = st.sidebar.radio(
-    "Filtro por lag",
-    options=["Todos", "Solo lag = 0", "Solo lag > 0"],
+x_source_mode = st.sidebar.selectbox(
+    "Variable del eje X",
+    options=[
+        "Variable fenológica rezagada",
+        "Semana fenológica",
+        "Peso suavizado lag 1",
+    ],
     index=0,
 )
 
+selected_base_var = None
+selected_lag = None
+selected_x_col = None
+
+if x_source_mode == "Variable fenológica rezagada":
+    selected_base_var = st.sidebar.selectbox(
+        "Variable explicativa base",
+        options=PHENOLOGY_COLS,
+        index=PHENOLOGY_COLS.index("FRUTO VERDE") if "FRUTO VERDE" in PHENOLOGY_COLS else 0,
+    )
+
+    selected_lag = st.sidebar.slider(
+        "Lag a visualizar",
+        min_value=1,
+        max_value=MAX_LAG,
+        value=1,
+    )
+
+    selected_x_col = f"{selected_base_var}__LAG_{selected_lag}"
+
+elif x_source_mode == "Semana fenológica":
+    selected_x_col = "SEMANA FENOLOGICA"
+
+elif x_source_mode == "Peso suavizado lag 1":
+    selected_x_col = "PESO_BAYA_SUAVIZADO__LAG_1"
+
+x_transform_mode = st.sidebar.radio(
+    "Transformación del eje X",
+    options=["Original", "Log(X)"],
+    index=0,
+)
+
+lag_filter = None
+if x_source_mode == "Variable fenológica rezagada":
+    lag_filter = st.sidebar.radio(
+        "Filtro por lag",
+        options=["Todos", "Solo lag = 0", "Solo lag > 0"],
+        index=0,
+    )
+
 outlier_mode = st.sidebar.radio(
-    "Filtro de outliers en la variable objetivo",
+    "Filtro de outliers en la visual actual",
     options=["Todos", "Todos excepto outliers"],
     index=0,
 )
 
-# NUEVO: tipo de modelo
 model_type = st.sidebar.selectbox(
     "Tipo de modelo",
     options=["Lineal", "Polinomial (grado 2)", "Logístico"],
     index=0,
 )
 
-show_trend = st.sidebar.checkbox("Mostrar línea de tendencia lineal", value=True)
+show_trend = st.sidebar.checkbox("Mostrar modelo ajustado", value=True)
 
 # Base para visuales
 viz_cols = [
@@ -660,6 +722,9 @@ viz_cols = [
     "AÑO-SEMANA ACTUAL",
     "ENTITY_KEY",
     TARGET_COL,
+    "PESO_BAYA_SUAVIZADO",
+    "PESO_BAYA_SUAVIZADO__LAG_1",
+    "SEMANA FENOLOGICA",
     "DELTA_BW",
     "DELTA_BW_%",
     selected_x_col,
@@ -672,16 +737,20 @@ if selected_x_col not in viz_df.columns:
     st.error(f"No existe la columna seleccionada para análisis: {selected_x_col}")
     st.stop()
 
-# NUEVO: filtro lag
-if lag_filter == "Solo lag = 0":
-    viz_df = viz_df[viz_df[selected_x_col] == 0]
+# Filtro por lag solo si aplica
+if x_source_mode == "Variable fenológica rezagada" and lag_filter is not None:
+    if lag_filter == "Solo lag = 0":
+        viz_df = viz_df[viz_df[selected_x_col] == 0]
+    elif lag_filter == "Solo lag > 0":
+        viz_df = viz_df[viz_df[selected_x_col] > 0]
 
-elif lag_filter == "Solo lag > 0":
-    viz_df = viz_df[viz_df[selected_x_col] > 0]
+# Transformación para análisis y gráficos
+viz_df["X_PLOT"] = transform_x_series(viz_df[selected_x_col], x_transform_mode)
+x_axis_label = get_x_axis_label(selected_x_col, x_transform_mode)
 
-# NUEVO: outliers por Mahalanobis según X e Y actuales
+# Outliers por Mahalanobis según la visual actual
 if outlier_mode == "Todos excepto outliers":
-    valid_mask = mahalanobis_filter(viz_df, selected_x_col, analysis_target)
+    valid_mask = mahalanobis_filter(viz_df, "X_PLOT", analysis_target)
     viz_df = viz_df[valid_mask].copy()
 
 # =========================================================
@@ -695,9 +764,9 @@ c2.metric("Grupos únicos", f"{filtered['ENTITY_KEY'].nunique():,}")
 c3.metric("Con peso válido", f"{filtered[TARGET_COL].notna().sum():,}")
 c4.metric("Delta válido", f"{filtered['DELTA_BW'].notna().sum():,}")
 c5.metric("Delta % válido", f"{filtered['DELTA_BW_%'].notna().sum():,}")
-c6.metric("Filas en visual actual", f"{len(viz_df.dropna(subset=[analysis_target, selected_x_col])):,}")
+c6.metric("Filas en visual actual", f"{len(viz_df.dropna(subset=[analysis_target, 'X_PLOT'])):,}")
 
-missing_vars = [TARGET_COL] + PHENOLOGY_COLS + ["DELTA_BW", "DELTA_BW_%"]
+missing_vars = [TARGET_COL] + PHENOLOGY_COLS + ["SEMANA FENOLOGICA", "DELTA_BW", "DELTA_BW_%", "PESO_BAYA_SUAVIZADO__LAG_1"]
 
 missing_summary = pd.DataFrame(
     {
@@ -733,6 +802,7 @@ with tab1:
 
     scatter_cols = [
         selected_x_col,
+        "X_PLOT",
         analysis_target,
         "CAMPAÑA",
         "AÑO",
@@ -753,7 +823,7 @@ with tab1:
     else:
         fig = px.scatter(
             scatter_df,
-            x=selected_x_col,
+            x="X_PLOT",
             y=analysis_target,
             color="VARIEDAD",
             hover_data=[
@@ -766,23 +836,24 @@ with tab1:
                     "CAMPO",
                     "VARIEDAD",
                     "ENTITY_KEY",
+                    selected_x_col,
                 ] if c in scatter_df.columns
             ],
             opacity=0.65,
         )
 
         if show_trend:
-            fig = add_model(fig, scatter_df[selected_x_col], scatter_df[analysis_target], model_type)
+            fig = add_model(fig, scatter_df["X_PLOT"], scatter_df[analysis_target], model_type)
 
         fig.update_layout(
-            xaxis_title=selected_x_col,
+            xaxis_title=x_axis_label,
             yaxis_title=analysis_target,
             height=600,
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        corr_p = scatter_df[selected_x_col].corr(scatter_df[analysis_target], method="pearson")
-        corr_s = scatter_df[selected_x_col].corr(scatter_df[analysis_target], method="spearman")
+        corr_p = scatter_df["X_PLOT"].corr(scatter_df[analysis_target], method="pearson")
+        corr_s = scatter_df["X_PLOT"].corr(scatter_df[analysis_target], method="spearman")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("n", f"{len(scatter_df):,}")
@@ -793,10 +864,11 @@ with tab1:
 # TAB 2: BOXPLOT
 # =========================================================
 with tab2:
-    st.subheader("Boxplot por niveles de la variable rezagada")
+    st.subheader("Boxplot por niveles de la variable del eje X")
 
     box_cols = [
         selected_x_col,
+        "X_PLOT",
         analysis_target,
         "CAMPAÑA",
         "AÑO",
@@ -820,7 +892,7 @@ with tab2:
             n_bins = st.slider("Número de bins", min_value=4, max_value=10, value=5, key="bins_slider")
 
             box_df["BIN_X"] = pd.qcut(
-                box_df[selected_x_col],
+                box_df["X_PLOT"],
                 q=n_bins,
                 duplicates="drop",
             )
@@ -859,6 +931,7 @@ with tab2:
                                 sub["VARIEDAD"].astype(str),
                                 sub["ENTITY_KEY"].astype(str),
                                 sub[selected_x_col].astype(float),
+                                sub["X_PLOT"].astype(float),
                             ],
                             axis=-1,
                         ),
@@ -873,13 +946,14 @@ with tab2:
                             "TURNO: %{customdata[5]}<br>"
                             "VARIEDAD: %{customdata[6]}<br>"
                             f"{selected_x_col}: %{{customdata[8]:.4f}}<br>"
+                            f"{x_axis_label}: %{{customdata[9]:.4f}}<br>"
                             "ENTITY_KEY: %{customdata[7]}<extra></extra>"
                         ),
                     )
                 )
 
             fig.update_layout(
-                xaxis_title=f"Bins de {selected_x_col}",
+                xaxis_title=f"Bins de {x_axis_label}",
                 yaxis_title=analysis_target,
                 height=650,
                 showlegend=False,
@@ -1060,7 +1134,10 @@ with tab3:
             "CAMPO",
             "TURNO",
             "VARIEDAD",
+            "SEMANA FENOLOGICA",
             TARGET_COL,
+            "PESO_BAYA_SUAVIZADO",
+            "PESO_BAYA_SUAVIZADO__LAG_1",
             "DELTA_BW",
             "DELTA_BW_%",
             selected_x_col,
@@ -1077,14 +1154,14 @@ with tab3:
 # =========================================================
 with tab4:
     st.subheader("Estabilidad de la relación")
-    st.caption("Se evalúa la consistencia de la relación entre la variable objetivo y el lag seleccionado por CAMPAÑA y VARIEDAD.")
+    st.caption("Se evalúa la consistencia de la relación entre la variable objetivo y la variable X seleccionada por CAMPAÑA y VARIEDAD.")
 
-    stability_base = viz_df[[analysis_target, selected_x_col, "CAMPAÑA", "VARIEDAD"]].copy()
+    stability_base = viz_df[[analysis_target, "X_PLOT", "CAMPAÑA", "VARIEDAD"]].copy()
 
     stab_campaign = compute_group_stability(
         df=stability_base,
         group_col="CAMPAÑA",
-        x_col=selected_x_col,
+        x_col="X_PLOT",
         y_col=analysis_target,
         min_obs=MIN_OBS_STABILITY,
     )
@@ -1092,7 +1169,7 @@ with tab4:
     stab_variety = compute_group_stability(
         df=stability_base,
         group_col="VARIEDAD",
-        x_col=selected_x_col,
+        x_col="X_PLOT",
         y_col=analysis_target,
         min_obs=MIN_OBS_STABILITY,
     )
@@ -1163,12 +1240,11 @@ with tab4:
 # =========================================================
 with tab5:
     st.subheader("Resumen de hallazgos")
-    st.caption("Resumen cuantitativo para identificar qué variable y qué lag muestran la señal más fuerte.")
+    st.caption("Resumen cuantitativo para identificar qué variable muestra la señal más fuerte frente al delta semanal.")
 
     findings_df = build_findings_summary(
         df=viz_df,
         analysis_target=analysis_target,
-        base_vars=PHENOLOGY_COLS,
         max_lag=MAX_LAG,
     )
 
@@ -1180,13 +1256,13 @@ with tab5:
             if col in disp.columns:
                 disp[col] = disp[col].round(4)
 
-        st.markdown("**Mejor lag por variable base**")
+        st.markdown("**Mejor señal por variable**")
         st.dataframe(disp, use_container_width=True)
 
         top_row = findings_df.iloc[0]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Variable con mayor señal", str(top_row["variable_base"]))
-        c2.metric("Mejor lag", f"Lag {int(top_row['mejor_lag'])}")
+        c1.metric("Tipo de X con mayor señal", str(top_row["tipo_x"]))
+        c2.metric("Variable", str(top_row["variable_base"]))
         c3.metric("Spearman", f"{top_row['spearman']:.4f}" if pd.notna(top_row["spearman"]) else "NA")
         c4.metric("n", f"{int(top_row['n']):,}")
 
@@ -1194,25 +1270,27 @@ with tab5:
             findings_df.sort_values("abs_spearman", ascending=False),
             x="variable_base",
             y="abs_spearman",
-            text="mejor_lag",
-            title="Magnitud de señal por variable base (|Spearman| del mejor lag)",
+            color="tipo_x",
+            text="n",
+            title="Magnitud de señal por variable (|Spearman|)",
         )
         fig.update_layout(
             height=500,
-            xaxis_title="Variable base",
+            xaxis_title="Variable",
             yaxis_title="|Spearman|",
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # Resumen corto para ayudarte luego en Confluence
-        st.markdown("**Lectura rápida**")
         best_name = str(top_row["variable_base"])
-        best_lag = int(top_row["mejor_lag"])
+        best_type = str(top_row["tipo_x"])
         best_s = top_row["spearman"]
-        st.info(
-            f"La variable con mayor señal en la configuración actual es **{best_name}** "
-            f"con **lag {best_lag}**, mostrando una correlación de Spearman de "
-            f"**{best_s:.4f}**."
-            if pd.notna(best_s)
-            else f"La variable con mayor señal en la configuración actual es **{best_name}** con **lag {best_lag}**."
-        )
+        if pd.notna(best_s):
+            st.info(
+                f"La mayor señal en la configuración actual corresponde a **{best_name}** "
+                f"(tipo: **{best_type}**) con una correlación de Spearman de **{best_s:.4f}**."
+            )
+        else:
+            st.info(
+                f"La mayor señal en la configuración actual corresponde a **{best_name}** "
+                f"(tipo: **{best_type}**)."
+            )
