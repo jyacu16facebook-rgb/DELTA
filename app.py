@@ -7,6 +7,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from scipy.stats import kruskal
+from scipy.spatial.distance import mahalanobis
+from scipy.optimize import curve_fit
 
 
 # =========================================================
@@ -179,10 +181,22 @@ def standardize_current_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def smooth_series(series: pd.Series) -> pd.Series:
+    """
+    Suavizado de 3 semanas centrado.
+    Ejemplo:
+    semana 1 -> promedio de (1,2)
+    semana 2 -> promedio de (1,2,3)
+    semana 3 -> promedio de (2,3,4)
+    """
+    return series.rolling(window=3, center=True, min_periods=1).mean()
+
+
 def add_delta_only(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calcula DELTA_BW y DELTA_BW_%.
     No recalcula lags porque la data actual ya los trae.
+    Aplica suavizado de 3 semanas al TARGET antes del delta.
     """
     df = df.copy()
 
@@ -217,6 +231,9 @@ def add_delta_only(df: pd.DataFrame) -> pd.DataFrame:
         st.stop()
 
     g = df.groupby(ENTITY_COLS, dropna=False, sort=False)
+
+    # SUAVIZADO antes del cálculo del delta
+    df[TARGET_COL] = g[TARGET_COL].transform(smooth_series)
 
     prev_weight = g[TARGET_COL].shift(1)
     prev_week_date = g["WEEK_START_DATE"].shift(1)
@@ -259,6 +276,32 @@ def iqr_filter_mask(series: pd.Series) -> pd.Series:
     lower = q1 - 1.5 * iqr
     upper = q3 + 1.5 * iqr
     return s.between(lower, upper, inclusive="both")
+
+
+def mahalanobis_filter(df: pd.DataFrame, x_col: str, y_col: str, threshold: float = 3.0) -> pd.Series:
+    """
+    Detecta outliers en la relación X vs Y usando distancia de Mahalanobis.
+    Se aplica sobre las variables actualmente ploteadas.
+    """
+    sub = df[[x_col, y_col]].dropna().copy()
+
+    if len(sub) < 5:
+        return pd.Series(True, index=df.index)
+
+    X = sub[[x_col, y_col]].to_numpy(dtype=float)
+    mean = X.mean(axis=0)
+    cov = np.cov(X, rowvar=False)
+
+    try:
+        inv_cov = np.linalg.inv(cov)
+    except Exception:
+        return pd.Series(True, index=df.index)
+
+    distances = np.array([mahalanobis(row, mean, inv_cov) for row in X])
+    keep_mask = distances < threshold
+
+    valid_index = sub.index[keep_mask]
+    return df.index.isin(valid_index)
 
 
 def apply_sidebar_filters(df: pd.DataFrame) -> pd.DataFrame:
@@ -305,6 +348,71 @@ def add_trendline(fig, x: pd.Series, y: pd.Series, name: str = "Tendencia lineal
             y=y_line,
             mode="lines",
             name=name,
+        )
+    )
+    return fig
+
+
+def add_model(fig, x: pd.Series, y: pd.Series, model_type: str):
+    """
+    Agrega al scatter el modelo seleccionado:
+    - Lineal
+    - Polinomial (grado 2)
+    - Logístico
+    """
+    x_num = pd.to_numeric(x, errors="coerce")
+    y_num = pd.to_numeric(y, errors="coerce")
+    valid = x_num.notna() & y_num.notna()
+
+    if valid.sum() < 5:
+        return fig
+
+    x_v = x_num[valid].values
+    y_v = y_num[valid].values
+
+    if len(np.unique(x_v)) < 2:
+        return fig
+
+    x_line = np.linspace(x_v.min(), x_v.max(), 200)
+
+    if model_type == "Lineal":
+        coef = np.polyfit(x_v, y_v, 1)
+        y_line = coef[0] * x_line + coef[1]
+        trace_name = "Modelo lineal"
+
+    elif model_type == "Polinomial (grado 2)":
+        coef = np.polyfit(x_v, y_v, 2)
+        y_line = coef[0] * x_line**2 + coef[1] * x_line + coef[2]
+        trace_name = "Modelo polinomial (grado 2)"
+
+    elif model_type == "Logístico":
+        def logistic(x_arr, L, k, x0):
+            return L / (1 + np.exp(-k * (x_arr - x0)))
+
+        try:
+            L0 = np.nanmax(y_v)
+            k0 = 0.01
+            x00 = np.nanmedian(x_v)
+            popt, _ = curve_fit(
+                logistic,
+                x_v,
+                y_v,
+                p0=[L0, k0, x00],
+                maxfev=10000,
+            )
+            y_line = logistic(x_line, *popt)
+            trace_name = "Modelo logístico"
+        except Exception:
+            return fig
+    else:
+        return fig
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_line,
+            y=y_line,
+            mode="lines",
+            name=trace_name,
         )
     )
     return fig
@@ -486,6 +594,7 @@ with st.expander("Verificación técnica del enfoque usado", expanded=False):
 - Si falta una semana intermedia, el valor queda vacío
 - `DELTA_BW_%` queda vacío si el peso previo es nulo o igual a 0
 - Los lags ya no se recalculan: se usan directamente desde la data actual
+- Se aplica suavizado de 3 semanas al peso antes de calcular el delta
         """
     )
 
@@ -522,9 +631,23 @@ selected_lag = st.sidebar.slider(
 
 selected_x_col = f"{selected_base_var}__LAG_{selected_lag}"
 
+# NUEVO: filtro por lag
+lag_filter = st.sidebar.radio(
+    "Filtro por lag",
+    options=["Todos", "Solo lag = 0", "Solo lag > 0"],
+    index=0,
+)
+
 outlier_mode = st.sidebar.radio(
     "Filtro de outliers en la variable objetivo",
     options=["Todos", "Todos excepto outliers"],
+    index=0,
+)
+
+# NUEVO: tipo de modelo
+model_type = st.sidebar.selectbox(
+    "Tipo de modelo",
+    options=["Lineal", "Polinomial (grado 2)", "Logístico"],
     index=0,
 )
 
@@ -549,8 +672,16 @@ if selected_x_col not in viz_df.columns:
     st.error(f"No existe la columna seleccionada para análisis: {selected_x_col}")
     st.stop()
 
+# NUEVO: filtro lag
+if lag_filter == "Solo lag = 0":
+    viz_df = viz_df[viz_df[selected_x_col] == 0]
+
+elif lag_filter == "Solo lag > 0":
+    viz_df = viz_df[viz_df[selected_x_col] > 0]
+
+# NUEVO: outliers por Mahalanobis según X e Y actuales
 if outlier_mode == "Todos excepto outliers":
-    valid_mask = iqr_filter_mask(viz_df[analysis_target])
+    valid_mask = mahalanobis_filter(viz_df, selected_x_col, analysis_target)
     viz_df = viz_df[valid_mask].copy()
 
 # =========================================================
@@ -641,7 +772,7 @@ with tab1:
         )
 
         if show_trend:
-            fig = add_trendline(fig, scatter_df[selected_x_col], scatter_df[analysis_target])
+            fig = add_model(fig, scatter_df[selected_x_col], scatter_df[analysis_target], model_type)
 
         fig.update_layout(
             xaxis_title=selected_x_col,
